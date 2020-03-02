@@ -13,15 +13,12 @@
  */
 package com.facebook.presto.sql.planner.plan;
 
-import com.facebook.presto.metadata.AnalyzeTableHandle;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.PlanNodeId;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.fasterxml.jackson.annotation.JsonSubTypes;
-import com.fasterxml.jackson.annotation.JsonTypeInfo;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 
@@ -33,8 +30,8 @@ public class StatisticsWriterNode
         extends InternalPlanNode
 {
     private final PlanNode source;
+    private final TableHandle tableHandle;
     private final VariableReferenceExpression rowCountVariable;
-    private final WriteStatisticsTarget target;
     private final boolean rowCountEnabled;
     private final StatisticAggregationsDescriptor<VariableReferenceExpression> descriptor;
 
@@ -42,14 +39,14 @@ public class StatisticsWriterNode
     public StatisticsWriterNode(
             @JsonProperty("id") PlanNodeId id,
             @JsonProperty("source") PlanNode source,
-            @JsonProperty("target") WriteStatisticsTarget target,
+            @JsonProperty("tableHandle") TableHandle tableHandle,
             @JsonProperty("rowCountVariable") VariableReferenceExpression rowCountVariable,
             @JsonProperty("rowCountEnabled") boolean rowCountEnabled,
             @JsonProperty("descriptor") StatisticAggregationsDescriptor<VariableReferenceExpression> descriptor)
     {
         super(id);
         this.source = requireNonNull(source, "source is null");
-        this.target = requireNonNull(target, "target is null");
+        this.tableHandle = requireNonNull(tableHandle, "tableHandle is null");
         this.rowCountVariable = requireNonNull(rowCountVariable, "rowCountVariable is null");
         this.rowCountEnabled = rowCountEnabled;
         this.descriptor = requireNonNull(descriptor, "descriptor is null");
@@ -62,9 +59,9 @@ public class StatisticsWriterNode
     }
 
     @JsonProperty
-    public WriteStatisticsTarget getTarget()
+    public TableHandle getTableHandle()
     {
-        return target;
+        return tableHandle;
     }
 
     @JsonProperty
@@ -103,7 +100,7 @@ public class StatisticsWriterNode
         return new StatisticsWriterNode(
                 getId(),
                 Iterables.getOnlyElement(newChildren),
-                target,
+                tableHandle,
                 rowCountVariable,
                 rowCountEnabled,
                 descriptor);
@@ -113,62 +110,5 @@ public class StatisticsWriterNode
     public <R, C> R accept(InternalPlanVisitor<R, C> visitor, C context)
     {
         return visitor.visitStatisticsWriterNode(this, context);
-    }
-
-    @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "@type")
-    @JsonSubTypes({
-            @JsonSubTypes.Type(value = WriteStatisticsHandle.class, name = "WriteStatisticsHandle")})
-    @SuppressWarnings({"EmptyClass", "ClassMayBeInterface"})
-    public abstract static class WriteStatisticsTarget
-    {
-        @Override
-        public abstract String toString();
-    }
-
-    public static class WriteStatisticsHandle
-            extends WriteStatisticsTarget
-    {
-        private final AnalyzeTableHandle handle;
-
-        @JsonCreator
-        public WriteStatisticsHandle(@JsonProperty("handle") AnalyzeTableHandle handle)
-        {
-            this.handle = requireNonNull(handle, "handle is null");
-        }
-
-        @JsonProperty
-        public AnalyzeTableHandle getHandle()
-        {
-            return handle;
-        }
-
-        @Override
-        public String toString()
-        {
-            return handle.toString();
-        }
-    }
-
-    // only used during planning -- will not be serialized
-    public static class WriteStatisticsReference
-            extends WriteStatisticsTarget
-    {
-        private final TableHandle handle;
-
-        public WriteStatisticsReference(TableHandle handle)
-        {
-            this.handle = requireNonNull(handle, "handle is null");
-        }
-
-        public TableHandle getHandle()
-        {
-            return handle;
-        }
-
-        @Override
-        public String toString()
-        {
-            return handle.toString();
-        }
     }
 }

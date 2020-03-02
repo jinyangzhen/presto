@@ -14,6 +14,7 @@
 package com.facebook.presto.spi.block;
 
 import io.airlift.slice.Slice;
+import io.airlift.slice.SliceOutput;
 
 import java.util.function.BiConsumer;
 
@@ -81,9 +82,10 @@ public interface Block
     }
 
     /**
-     * Gets an object in the value at {@code position}.
+     * Gets a block in the value at {@code position}.
+     * @return
      */
-    default <T> T getObject(int position, Class<T> clazz)
+    default Block getBlock(int position)
     {
         throw new UnsupportedOperationException(getClass().getName());
     }
@@ -122,6 +124,11 @@ public interface Block
      * Appends the value at {@code position} to {@code blockBuilder} and close the entry.
      */
     void writePositionTo(int position, BlockBuilder blockBuilder);
+
+    /**
+     * Appends the value at {@code position} to {@code output}.
+     */
+    void writePositionTo(int position, SliceOutput output);
 
     /**
      * Is the byte sequences at {@code offset} in the value at {@code position} equal

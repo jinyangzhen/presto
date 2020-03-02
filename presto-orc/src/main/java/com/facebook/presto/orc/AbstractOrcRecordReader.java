@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.orc;
 
+import com.facebook.presto.hive.HiveFileContext;
 import com.facebook.presto.memory.context.AggregatedMemoryContext;
 import com.facebook.presto.orc.metadata.ColumnEncoding;
 import com.facebook.presto.orc.metadata.MetadataReader;
@@ -131,7 +132,9 @@ abstract class AbstractOrcRecordReader<T extends StreamReader>
             Map<String, Slice> userMetadata,
             AggregatedMemoryContext systemMemoryUsage,
             Optional<OrcWriteValidation> writeValidation,
-            int initialBatchSize)
+            int initialBatchSize,
+            StripeMetadataSource stripeMetadataSource,
+            HiveFileContext hiveFileContext)
     {
         requireNonNull(includedColumns, "includedColumns is null");
         requireNonNull(predicate, "predicate is null");
@@ -158,7 +161,7 @@ abstract class AbstractOrcRecordReader<T extends StreamReader>
         for (Map.Entry<Integer, Type> entry : includedColumns.entrySet()) {
             // an old file can have less columns since columns can be added
             // after the file was written
-            if (entry.getKey() < root.getFieldCount()) {
+            if (entry.getKey() >= 0 && entry.getKey() < root.getFieldCount()) {
                 presentColumns.add(entry.getKey());
                 presentColumnsAndTypes.put(entry.getKey(), entry.getValue());
             }
@@ -224,7 +227,9 @@ abstract class AbstractOrcRecordReader<T extends StreamReader>
                 predicate,
                 hiveWriterVersion,
                 metadataReader,
-                writeValidation);
+                writeValidation,
+                stripeMetadataSource,
+                hiveFileContext);
 
         this.streamReaders = requireNonNull(streamReaders, "streamReaders is null");
         for (int columnId = 0; columnId < root.getFieldCount(); columnId++) {
@@ -346,6 +351,11 @@ abstract class AbstractOrcRecordReader<T extends StreamReader>
     {
         try (Closer closer = Closer.create()) {
             closer.register(orcDataSource);
+            for (StreamReader column : streamReaders) {
+                if (column != null) {
+                    closer.register(column::close);
+                }
+            }
         }
 
         if (writeChecksumBuilder.isPresent()) {
@@ -602,7 +612,7 @@ abstract class AbstractOrcRecordReader<T extends StreamReader>
             nestedStreams.add(createStreamDescriptor(parentStreamName, "key", type.getFieldTypeIndex(0), types, dataSource));
             nestedStreams.add(createStreamDescriptor(parentStreamName, "value", type.getFieldTypeIndex(1), types, dataSource));
         }
-        return new StreamDescriptor(parentStreamName, typeId, fieldName, type.getOrcTypeKind(), dataSource, nestedStreams.build());
+        return new StreamDescriptor(parentStreamName, typeId, fieldName, type, dataSource, nestedStreams.build());
     }
 
     protected boolean shouldValidateWritePageChecksum()

@@ -16,6 +16,7 @@ package com.facebook.presto.spi.block;
 
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.type.Type;
+import io.airlift.slice.SliceInput;
 import org.openjdk.jol.info.ClassLayout;
 
 import javax.annotation.Nullable;
@@ -99,7 +100,7 @@ public class MapBlockBuilder
         this.mapIsNull = requireNonNull(mapIsNull, "mapIsNull is null");
         this.keyBlockBuilder = requireNonNull(keyBlockBuilder, "keyBlockBuilder is null");
         this.valueBlockBuilder = requireNonNull(valueBlockBuilder, "valueBlockBuilder is null");
-        this.hashTables = new HashTables(Optional.of(requireNonNull(rawHashTables, "hashTables is null")), rawHashTables.length);
+        this.hashTables = new HashTables(Optional.of(requireNonNull(rawHashTables, "hashTables is null")), 0, rawHashTables.length);
     }
 
     @Override
@@ -333,6 +334,25 @@ public class MapBlockBuilder
     }
 
     @Override
+    public BlockBuilder readPositionFrom(SliceInput input)
+    {
+        boolean isNull = input.readByte() == 0;
+        if (isNull) {
+            appendNull();
+        }
+        else {
+            int length = input.readInt();
+            SingleMapBlockWriter singleMapBlockWriter = beginBlockEntry();
+            for (int i = 0; i < length; i++) {
+                singleMapBlockWriter.readPositionFrom(input);
+                singleMapBlockWriter.readPositionFrom(input);
+            }
+            closeEntry();
+        }
+        return this;
+    }
+
+    @Override
     public Block build()
     {
         if (currentEntryOpened) {
@@ -349,7 +369,7 @@ public class MapBlockBuilder
                 offsets,
                 keyBlockBuilder.build(),
                 valueBlockBuilder.build(),
-                new HashTables(Optional.of(Arrays.copyOf(rawHashTables.get(), hashTablesEntries)), hashTablesEntries),
+                new HashTables(Optional.of(Arrays.copyOf(rawHashTables.get(), hashTablesEntries)), positionCount, hashTablesEntries),
                 keyType,
                 keyBlockNativeEquals,
                 keyNativeHashCode,
@@ -557,7 +577,7 @@ public class MapBlockBuilder
         return (int) ((Integer.toUnsignedLong(Long.hashCode(hashcode)) * hashTableSize) >> 32);
     }
 
-    private static void verify(boolean assertion, String message)
+    static void verify(boolean assertion, String message)
     {
         if (!assertion) {
             throw new AssertionError(message);

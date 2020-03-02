@@ -17,12 +17,14 @@ import com.facebook.presto.orc.OrcBatchRecordReader;
 import com.facebook.presto.orc.OrcDataSource;
 import com.facebook.presto.orc.OrcPredicate;
 import com.facebook.presto.orc.OrcReader;
+import com.facebook.presto.orc.OrcReaderOptions;
+import com.facebook.presto.orc.StorageStripeMetadataSource;
+import com.facebook.presto.orc.cache.StorageOrcFileTailSource;
 import com.facebook.presto.spi.Page;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.type.Type;
 import com.google.common.collect.AbstractIterator;
-import com.google.common.collect.ImmutableList;
 import io.airlift.units.DataSize;
 
 import java.io.IOException;
@@ -32,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_WRITER_DATA_ERROR;
+import static com.facebook.presto.hive.HiveFileContext.DEFAULT_HIVE_FILE_CONTEXT;
 import static com.facebook.presto.memory.context.AggregatedMemoryContext.newSimpleAggregatedMemoryContext;
 import static com.facebook.presto.orc.OrcEncoding.ORC;
 import static com.facebook.presto.orc.OrcReader.INITIAL_BATCH_SIZE;
@@ -42,21 +45,26 @@ import static org.joda.time.DateTimeZone.UTC;
 public class TempFileReader
         extends AbstractIterator<Page>
 {
-    private final List<Type> types;
+    private final int columnCount;
     private final OrcBatchRecordReader reader;
 
     public TempFileReader(List<Type> types, OrcDataSource dataSource)
     {
-        this.types = ImmutableList.copyOf(requireNonNull(types, "types is null"));
+        requireNonNull(types, "types is null");
+        this.columnCount = types.size();
 
         try {
             OrcReader orcReader = new OrcReader(
                     dataSource,
                     ORC,
-                    new DataSize(1, MEGABYTE),
-                    new DataSize(8, MEGABYTE),
-                    new DataSize(8, MEGABYTE),
-                    new DataSize(16, MEGABYTE));
+                    new StorageOrcFileTailSource(),
+                    new StorageStripeMetadataSource(),
+                    new OrcReaderOptions(
+                            new DataSize(1, MEGABYTE),
+                            new DataSize(8, MEGABYTE),
+                            new DataSize(16, MEGABYTE),
+                            false),
+                    DEFAULT_HIVE_FILE_CONTEXT);
 
             Map<Integer, Type> includedColumns = new HashMap<>();
             for (int i = 0; i < types.size(); i++) {
@@ -68,7 +76,8 @@ public class TempFileReader
                     OrcPredicate.TRUE,
                     UTC,
                     newSimpleAggregatedMemoryContext(),
-                    INITIAL_BATCH_SIZE);
+                    INITIAL_BATCH_SIZE,
+                    DEFAULT_HIVE_FILE_CONTEXT);
         }
         catch (IOException e) {
             throw new PrestoException(HIVE_WRITER_DATA_ERROR, "Failed to read temporary data");
@@ -88,9 +97,9 @@ public class TempFileReader
                 return endOfData();
             }
 
-            Block[] blocks = new Block[types.size()];
-            for (int i = 0; i < types.size(); i++) {
-                blocks[i] = reader.readBlock(types.get(i), i).getLoadedBlock();
+            Block[] blocks = new Block[columnCount];
+            for (int i = 0; i < columnCount; i++) {
+                blocks[i] = reader.readBlock(i).getLoadedBlock();
             }
             return new Page(batchSize, blocks);
         }

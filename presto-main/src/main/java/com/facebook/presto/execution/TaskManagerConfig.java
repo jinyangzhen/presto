@@ -13,11 +13,11 @@
  */
 package com.facebook.presto.execution;
 
+import com.facebook.airlift.configuration.Config;
+import com.facebook.airlift.configuration.ConfigDescription;
+import com.facebook.airlift.configuration.DefunctConfig;
+import com.facebook.airlift.configuration.LegacyConfig;
 import com.facebook.presto.util.PowerOfTwo;
-import io.airlift.configuration.Config;
-import io.airlift.configuration.ConfigDescription;
-import io.airlift.configuration.DefunctConfig;
-import io.airlift.configuration.LegacyConfig;
 import io.airlift.units.DataSize;
 import io.airlift.units.DataSize.Unit;
 import io.airlift.units.Duration;
@@ -68,8 +68,10 @@ public class TaskManagerConfig
     private Duration infoUpdateInterval = new Duration(3, TimeUnit.SECONDS);
 
     private int writerCount = 1;
+    private Integer partitionedWriterCount;
     private int taskConcurrency = 16;
     private int httpResponseThreads = 100;
+    private int httpTimeoutConcurrency = 1;
     private int httpTimeoutThreads = 3;
 
     private int taskNotificationThreads = 5;
@@ -78,6 +80,7 @@ public class TaskManagerConfig
     private BigDecimal levelTimeMultiplier = new BigDecimal(2.0);
 
     private boolean legacyLifespanCompletionCondition;
+    private TaskPriorityTracking taskPriorityTracking = TaskPriorityTracking.TASK_FAIR;
 
     @MinDuration("1ms")
     @MaxDuration("10s")
@@ -399,6 +402,21 @@ public class TaskManagerConfig
 
     @Min(1)
     @PowerOfTwo
+    public Integer getPartitionedWriterCount()
+    {
+        return partitionedWriterCount;
+    }
+
+    @Config("task.partitioned-writer-count")
+    @ConfigDescription("Number of writers per task for partitioned writes. If not set, the number set by task.writer-count will be used")
+    public TaskManagerConfig setPartitionedWriterCount(Integer partitionedWriterCount)
+    {
+        this.partitionedWriterCount = partitionedWriterCount;
+        return this;
+    }
+
+    @Min(1)
+    @PowerOfTwo
     public int getTaskConcurrency()
     {
         return taskConcurrency;
@@ -432,9 +450,24 @@ public class TaskManagerConfig
     }
 
     @Config("task.http-timeout-threads")
+    @ConfigDescription("Total number of timeout threads across all timeout thread pools")
     public TaskManagerConfig setHttpTimeoutThreads(int httpTimeoutThreads)
     {
         this.httpTimeoutThreads = httpTimeoutThreads;
+        return this;
+    }
+
+    @Min(1)
+    public int getHttpTimeoutConcurrency()
+    {
+        return httpTimeoutConcurrency;
+    }
+
+    @Config("task.http-timeout-concurrency")
+    @ConfigDescription("Number of thread pools to handle timeouts. Threads per pool is calculated by http-timeout-threads / http-timeout-concurrency")
+    public TaskManagerConfig setHttpTimeoutConcurrency(int httpTimeoutConcurrency)
+    {
+        this.httpTimeoutConcurrency = httpTimeoutConcurrency;
         return this;
     }
 
@@ -478,5 +511,24 @@ public class TaskManagerConfig
     {
         this.legacyLifespanCompletionCondition = legacyLifespanCompletionCondition;
         return this;
+    }
+
+    @NotNull
+    public TaskPriorityTracking getTaskPriorityTracking()
+    {
+        return taskPriorityTracking;
+    }
+
+    @Config("task.task-priority-tracking")
+    public TaskManagerConfig setTaskPriorityTracking(TaskPriorityTracking taskPriorityTracking)
+    {
+        this.taskPriorityTracking = taskPriorityTracking;
+        return this;
+    }
+
+    public enum TaskPriorityTracking
+    {
+        TASK_FAIR,
+        QUERY_FAIR,
     }
 }

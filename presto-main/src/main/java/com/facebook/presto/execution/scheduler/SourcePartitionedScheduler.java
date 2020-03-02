@@ -41,19 +41,20 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 
+import static com.facebook.airlift.concurrent.MoreFutures.addSuccessCallback;
+import static com.facebook.airlift.concurrent.MoreFutures.getFutureValue;
+import static com.facebook.airlift.concurrent.MoreFutures.whenAnyComplete;
 import static com.facebook.presto.execution.scheduler.ScheduleResult.BlockedReason.MIXED_SPLIT_QUEUES_FULL_AND_WAITING_FOR_SOURCE;
 import static com.facebook.presto.execution.scheduler.ScheduleResult.BlockedReason.NO_ACTIVE_DRIVER_GROUP;
 import static com.facebook.presto.execution.scheduler.ScheduleResult.BlockedReason.SPLIT_QUEUES_FULL;
 import static com.facebook.presto.execution.scheduler.ScheduleResult.BlockedReason.WAITING_FOR_SOURCE;
+import static com.facebook.presto.spi.SplitContext.NON_CACHEABLE;
 import static com.facebook.presto.spi.connector.NotPartitionedPartitionHandle.NOT_PARTITIONED;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static com.google.common.util.concurrent.Futures.nonCancellationPropagating;
-import static io.airlift.concurrent.MoreFutures.addSuccessCallback;
-import static io.airlift.concurrent.MoreFutures.getFutureValue;
-import static io.airlift.concurrent.MoreFutures.whenAnyComplete;
 import static java.util.Objects.requireNonNull;
 
 public class SourcePartitionedScheduler
@@ -90,6 +91,9 @@ public class SourcePartitionedScheduler
     private final int splitBatchSize;
     private final PlanNodeId partitionedNode;
     private final boolean groupedExecution;
+
+    // TODO: Add LIFESPAN_ADDED into SourcePartitionedScheduler#State and remove this boolean
+    private boolean lifespanAdded;
 
     private final Map<Lifespan, ScheduleGroup> scheduleGroups = new HashMap<>();
     private State state = State.INITIALIZED;
@@ -179,6 +183,7 @@ public class SourcePartitionedScheduler
     public synchronized void startLifespan(Lifespan lifespan, ConnectorPartitionHandle partitionHandle)
     {
         checkState(state == State.INITIALIZED || state == State.SPLITS_ADDED);
+        lifespanAdded = true;
         scheduleGroups.put(lifespan, new ScheduleGroup(partitionHandle));
         whenFinishedOrNewLifespanAdded.set(null);
         whenFinishedOrNewLifespanAdded = SettableFuture.create();
@@ -188,6 +193,7 @@ public class SourcePartitionedScheduler
     public synchronized void rewindLifespan(Lifespan lifespan, ConnectorPartitionHandle partitionHandle)
     {
         checkState(state == State.INITIALIZED || state == State.SPLITS_ADDED, "Current state %s is not rewindable", state);
+        checkState(lifespanAdded, "Cannot rewind lifespan without any lifespan added before");
         scheduleGroups.remove(lifespan);
         splitSource.rewind(partitionHandle);
     }
@@ -236,7 +242,8 @@ public class SourcePartitionedScheduler
                                     splitSource.getConnectorId(),
                                     splitSource.getTransactionHandle(),
                                     new EmptySplit(splitSource.getConnectorId()),
-                                    lifespan));
+                                    lifespan,
+                                    NON_CACHEABLE));
                         }
                         scheduleGroup.state = ScheduleGroupState.NO_MORE_SPLITS;
                     }
@@ -315,7 +322,7 @@ public class SourcePartitionedScheduler
         // we can no longer claim schedule is complete after all splits are scheduled.
         // Splits schedule can only be considered as finished when all lifespan executions are done
         // (by calling `notifyAllLifespansFinishedExecution`)
-        if ((state == State.NO_MORE_SPLITS || state == State.FINISHED) || (!groupedExecution && scheduleGroups.isEmpty() && splitSource.isFinished())) {
+        if ((state == State.NO_MORE_SPLITS || state == State.FINISHED) || (!groupedExecution && lifespanAdded && scheduleGroups.isEmpty() && splitSource.isFinished())) {
             switch (state) {
                 case INITIALIZED:
                     // We have not scheduled a single split so far.

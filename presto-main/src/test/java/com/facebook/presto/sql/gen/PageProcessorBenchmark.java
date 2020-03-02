@@ -29,8 +29,8 @@ import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.parser.SqlParser;
-import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.planner.TypeProvider;
+import com.facebook.presto.sql.relational.RowExpressionOptimizer;
 import com.facebook.presto.sql.relational.SqlToRowExpressionTranslator;
 import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.sql.tree.NodeRef;
@@ -63,6 +63,7 @@ import java.util.concurrent.TimeUnit;
 import static com.facebook.presto.memory.context.AggregatedMemoryContext.newSimpleAggregatedMemoryContext;
 import static com.facebook.presto.metadata.MetadataManager.createTestMetadataManager;
 import static com.facebook.presto.operator.scalar.FunctionAssertions.createExpression;
+import static com.facebook.presto.spi.relation.ExpressionOptimizer.Level.OPTIMIZED;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.spi.type.VarcharType.VARCHAR;
 import static com.facebook.presto.sql.analyzer.ExpressionAnalyzer.getExpressionTypes;
@@ -86,7 +87,7 @@ public class PageProcessorBenchmark
     private static final int POSITIONS = 1024;
 
     private final DriverYieldSignal yieldSignal = new DriverYieldSignal();
-    private final Map<Symbol, Type> symbolTypes = new HashMap<>();
+    private final Map<String, Type> symbolTypes = new HashMap<>();
     private final Map<VariableReferenceExpression, Integer> sourceLayout = new HashMap<>();
 
     private CursorProcessor cursorProcessor;
@@ -111,7 +112,7 @@ public class PageProcessorBenchmark
 
         for (int i = 0; i < columnCount; i++) {
             VariableReferenceExpression variable = new VariableReferenceExpression(type.getDisplayName().toLowerCase(ENGLISH) + i, type);
-            symbolTypes.put(new Symbol(variable.getName()), type);
+            symbolTypes.put(variable.getName(), type);
             sourceLayout.put(variable, i);
         }
 
@@ -122,10 +123,10 @@ public class PageProcessorBenchmark
         PageFunctionCompiler pageFunctionCompiler = new PageFunctionCompiler(metadata, 0);
 
         inputPage = createPage(types, dictionaryBlocks);
-        pageProcessor = new ExpressionCompiler(metadata, pageFunctionCompiler).compilePageProcessor(Optional.of(getFilter(type)), projections).get();
+        pageProcessor = new ExpressionCompiler(metadata, pageFunctionCompiler).compilePageProcessor(TEST_SESSION.getSqlFunctionProperties(), Optional.of(getFilter(type)), projections).get();
 
         recordSet = new PageRecordSet(types, inputPage);
-        cursorProcessor = new ExpressionCompiler(metadata, pageFunctionCompiler).compileCursorProcessor(Optional.of(getFilter(type)), projections, "key").get();
+        cursorProcessor = new ExpressionCompiler(metadata, pageFunctionCompiler).compileCursorProcessor(TEST_SESSION.getSqlFunctionProperties(), Optional.of(getFilter(type)), projections, "key").get();
     }
 
     @Benchmark
@@ -181,7 +182,9 @@ public class PageProcessorBenchmark
         Expression expression = createExpression(value, METADATA, TypeProvider.copyOf(symbolTypes));
 
         Map<NodeRef<Expression>, Type> expressionTypes = getExpressionTypes(TEST_SESSION, METADATA, SQL_PARSER, TypeProvider.copyOf(symbolTypes), expression, emptyList(), WarningCollector.NOOP);
-        return SqlToRowExpressionTranslator.translate(expression, expressionTypes, sourceLayout, METADATA.getFunctionManager(), METADATA.getTypeManager(), TEST_SESSION, true);
+        RowExpression rowExpression = SqlToRowExpressionTranslator.translate(expression, expressionTypes, sourceLayout, METADATA.getFunctionManager(), METADATA.getTypeManager(), TEST_SESSION);
+        RowExpressionOptimizer optimizer = new RowExpressionOptimizer(METADATA);
+        return optimizer.optimize(rowExpression, OPTIMIZED, TEST_SESSION.toConnectorSession());
     }
 
     private static Page createPage(List<? extends Type> types, boolean dictionary)

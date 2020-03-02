@@ -16,6 +16,7 @@ package com.facebook.presto.spi.block;
 import com.facebook.presto.spi.predicate.Utils;
 import com.facebook.presto.spi.type.Type;
 import io.airlift.slice.Slice;
+import io.airlift.slice.SliceOutput;
 import org.openjdk.jol.info.ClassLayout;
 
 import java.util.function.BiConsumer;
@@ -209,10 +210,10 @@ public class RunLengthEncodedBlock
     }
 
     @Override
-    public <T> T getObject(int position, Class<T> clazz)
+    public Block getBlock(int position)
     {
         checkReadablePosition(position);
-        return value.getObject(0, clazz);
+        return value.getBlock(0);
     }
 
     @Override
@@ -241,6 +242,13 @@ public class RunLengthEncodedBlock
     {
         checkReadablePosition(position);
         value.writePositionTo(0, blockBuilder);
+    }
+
+    @Override
+    public void writePositionTo(int position, SliceOutput output)
+    {
+        checkReadablePosition(position);
+        value.writePositionTo(0, output);
     }
 
     @Override
@@ -282,7 +290,7 @@ public class RunLengthEncodedBlock
     public String toString()
     {
         StringBuilder sb = new StringBuilder(getClass().getSimpleName());
-        sb.append("positionCount=").append(positionCount);
+        sb.append("{positionCount=").append(positionCount);
         sb.append(", value=").append(value);
         sb.append('}');
         return sb.toString();
@@ -302,7 +310,7 @@ public class RunLengthEncodedBlock
     private void checkReadablePosition(int position)
     {
         if (position < 0 || position >= positionCount) {
-            throw new IllegalArgumentException("position is not valid");
+            throw new IllegalArgumentException("position is not valid: " + position);
         }
     }
 
@@ -359,7 +367,7 @@ public class RunLengthEncodedBlock
     public Block getBlockUnchecked(int internalPosition)
     {
         assert internalPositionInRange(internalPosition, getOffsetBase(), getPositionCount());
-        return value.getObject(0, Block.class);
+        return value.getBlock(0);
     }
 
     @Override

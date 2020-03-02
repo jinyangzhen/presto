@@ -15,9 +15,9 @@ package com.facebook.presto.sql.planner.iterative.rule.test;
 
 import com.facebook.presto.matching.Captures;
 import com.facebook.presto.matching.Pattern;
+import com.facebook.presto.spi.plan.Assignments;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.sql.planner.iterative.Rule;
-import com.facebook.presto.sql.planner.plan.Assignments;
 import com.google.common.collect.ImmutableList;
 import org.testng.annotations.Test;
 
@@ -38,8 +38,8 @@ public class TestRuleTester
                             p.project(
                                     Assignments.of(p.variable("y"), variable("x", BIGINT)),
                                     p.values(
-                                            ImmutableList.of(p.variable(p.symbol("x"))),
-                                            ImmutableList.of(constantExpressions(BIGINT, 1)))))
+                                            ImmutableList.of(p.variable("x")),
+                                            ImmutableList.of(constantExpressions(BIGINT, 1L)))))
                     .matches(
                             values(ImmutableList.of("different"), ImmutableList.of()));
         }

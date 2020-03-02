@@ -19,11 +19,12 @@ import com.facebook.presto.spi.function.FunctionHandle;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
-import com.facebook.presto.sql.planner.SymbolsExtractor;
+import com.facebook.presto.sql.planner.VariablesExtractor;
 import com.facebook.presto.sql.planner.plan.WindowNode;
 import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.sql.tree.FunctionCall;
 import com.facebook.presto.sql.tree.QualifiedName;
+import com.google.common.collect.ImmutableSet;
 
 import java.util.List;
 import java.util.Map;
@@ -73,7 +74,7 @@ public class WindowFunctionMatcher
 
         List<VariableReferenceExpression> matchedOutputs = windowNode.getWindowFunctions().entrySet().stream()
                 .filter(assignment -> {
-                    if (!expectedCall.getName().equals(QualifiedName.of(metadata.getFunctionManager().getFunctionMetadata(assignment.getValue().getFunctionCall().getFunctionHandle()).getName()))) {
+                    if (!expectedCall.getName().equals(QualifiedName.of(metadata.getFunctionManager().getFunctionMetadata(assignment.getValue().getFunctionCall().getFunctionHandle()).getName().getFunctionName()))) {
                         return false;
                     }
                     if (!functionHandle.map(assignment.getValue().getFunctionHandle()::equals).orElse(true)) {
@@ -92,7 +93,7 @@ public class WindowFunctionMatcher
                         RowExpression actualExpression = actualExpressions.get(i);
                         if (!isExpression(actualExpression)) {
                             SymbolAliases.Builder builder = SymbolAliases.builder();
-                            SymbolsExtractor.extractUnique(expectedExpression).forEach(symbol -> builder.put(symbol.getName(), symbol.toSymbolReference()));
+                            ImmutableSet.copyOf(VariablesExtractor.extractAllSymbols(expectedExpression)).forEach(symbol -> builder.put(symbol.getName(), symbol.toSymbolReference()));
                             if (!new RowExpressionVerifier(builder.build(), metadata, session).process(expectedExpression, actualExpression)) {
                                 return false;
                             }

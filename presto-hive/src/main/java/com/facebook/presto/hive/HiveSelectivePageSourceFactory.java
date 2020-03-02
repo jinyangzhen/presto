@@ -13,10 +13,12 @@
  */
 package com.facebook.presto.hive;
 
+import com.facebook.presto.hive.metastore.Storage;
 import com.facebook.presto.spi.ConnectorPageSource;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.Subfield;
 import com.facebook.presto.spi.predicate.TupleDomain;
+import com.facebook.presto.spi.relation.RowExpression;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.joda.time.DateTimeZone;
@@ -24,7 +26,6 @@ import org.joda.time.DateTimeZone;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Properties;
 
 public interface HiveSelectivePageSourceFactory
 {
@@ -35,10 +36,14 @@ public interface HiveSelectivePageSourceFactory
             long start,
             long length,
             long fileSize,
-            Properties schema,
+            Storage storage,
             List<HiveColumnHandle> columns,
-            Map<Integer, String> prefilledValues,   // key is hiveColumnIndex
-            List<Integer> outputColumns,            // element is hiveColumnIndex
+            Map<Integer, String> prefilledValues,           // key is hiveColumnIndex
+            Map<Integer, HiveCoercer> coercers,             // key is hiveColumnIndex
+            Optional<BucketAdaptation> bucketAdaptation,
+            List<Integer> outputColumns,                    // element is hiveColumnIndex
             TupleDomain<Subfield> domainPredicate,
-            DateTimeZone hiveStorageTimeZone);
+            RowExpression remainingPredicate,               // refers to columns by name; already optimized
+            DateTimeZone hiveStorageTimeZone,
+            HiveFileContext hiveFileContext);
 }

@@ -14,6 +14,7 @@
 package com.facebook.presto.spi.block;
 
 import io.airlift.slice.Slice;
+import io.airlift.slice.SliceOutput;
 
 import static com.facebook.presto.spi.block.BlockUtil.internalPositionInRange;
 
@@ -86,10 +87,10 @@ public abstract class AbstractSingleArrayBlock
     }
 
     @Override
-    public <T> T getObject(int position, Class<T> clazz)
+    public Block getBlock(int position)
     {
         checkReadablePosition(position);
-        return getBlock().getObject(position + start, clazz);
+        return getBlock().getBlock(position + start);
     }
 
     @Override
@@ -118,6 +119,13 @@ public abstract class AbstractSingleArrayBlock
     {
         checkReadablePosition(position);
         getBlock().writePositionTo(position + start, blockBuilder);
+    }
+
+    @Override
+    public void writePositionTo(int position, SliceOutput output)
+    {
+        checkReadablePosition(position);
+        getBlock().writePositionTo(position + start, output);
     }
 
     @Override

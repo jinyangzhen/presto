@@ -15,11 +15,11 @@ package com.facebook.presto.sql.planner.iterative.rule;
 
 import com.facebook.presto.matching.Captures;
 import com.facebook.presto.matching.Pattern;
+import com.facebook.presto.spi.plan.AggregationNode;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.sql.planner.TypeProvider;
 import com.facebook.presto.sql.planner.iterative.Rule;
 import com.facebook.presto.sql.planner.optimizations.AggregationNodeUtils;
-import com.facebook.presto.sql.planner.plan.AggregationNode;
 import com.google.common.collect.Streams;
 
 import java.util.Set;
@@ -47,7 +47,7 @@ public class PruneAggregationSourceColumns
                 aggregationNode.getGroupingKeys().stream(),
                 aggregationNode.getHashVariable().map(Stream::of).orElse(Stream.empty()),
                 aggregationNode.getAggregations().values().stream()
-                        .flatMap(aggregation -> getAggregationInputs(aggregation, context.getSymbolAllocator().getTypes())))
+                        .flatMap(aggregation -> getAggregationInputs(aggregation, context.getVariableAllocator().getTypes())))
                 .collect(toImmutableSet());
 
         return restrictChildOutputs(context.getIdAllocator(), aggregationNode, requiredInputs)

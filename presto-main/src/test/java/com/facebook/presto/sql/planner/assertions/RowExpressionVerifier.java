@@ -45,7 +45,6 @@ import com.facebook.presto.sql.tree.LongLiteral;
 import com.facebook.presto.sql.tree.Node;
 import com.facebook.presto.sql.tree.NotExpression;
 import com.facebook.presto.sql.tree.NullLiteral;
-import com.facebook.presto.sql.tree.QualifiedName;
 import com.facebook.presto.sql.tree.SimpleCaseExpression;
 import com.facebook.presto.sql.tree.StringLiteral;
 import com.facebook.presto.sql.tree.SymbolReference;
@@ -209,6 +208,11 @@ final class RowExpressionVerifier
             OperatorType actualOperatorType = functionMetadata.getOperatorType().get();
             OperatorType expectedOperatorType = getOperatorType(expected.getOperator());
             if (expectedOperatorType.equals(actualOperatorType)) {
+                if (actualOperatorType == EQUAL) {
+                    return (process(expected.getLeft(), ((CallExpression) actual).getArguments().get(0)) && process(expected.getRight(), ((CallExpression) actual).getArguments().get(1)))
+                            || (process(expected.getLeft(), ((CallExpression) actual).getArguments().get(1)) && process(expected.getRight(), ((CallExpression) actual).getArguments().get(0)));
+                }
+                // TODO support other comparison operators
                 return process(expected.getLeft(), ((CallExpression) actual).getArguments().get(0)) && process(expected.getRight(), ((CallExpression) actual).getArguments().get(1));
             }
         }
@@ -354,6 +358,12 @@ final class RowExpressionVerifier
     @Override
     protected Boolean visitStringLiteral(StringLiteral expected, RowExpression actual)
     {
+        if (actual instanceof CallExpression && functionResolution.isCastFunction(((CallExpression) actual).getFunctionHandle())) {
+            Object value = rowExpressionInterpreter(actual, metadata, session.toConnectorSession()).evaluate();
+            if (value instanceof Slice) {
+                return expected.getValue().equals(((Slice) value).toStringUtf8());
+            }
+        }
         if (actual instanceof ConstantExpression && actual.getType().getJavaType() == Slice.class) {
             String actualString = (String) LiteralInterpreter.evaluate(TEST_SESSION.toConnectorSession(), (ConstantExpression) actual);
             return expected.getValue().equals(actualString);
@@ -473,7 +483,7 @@ final class RowExpressionVerifier
         }
         CallExpression actualFunction = (CallExpression) actual;
 
-        if (!expected.getName().equals(QualifiedName.of(metadata.getFunctionManager().getFunctionMetadata(actualFunction.getFunctionHandle()).getName()))) {
+        if (!expected.getName().getSuffix().equals(metadata.getFunctionManager().getFunctionMetadata(actualFunction.getFunctionHandle()).getName().getFunctionName())) {
             return false;
         }
 

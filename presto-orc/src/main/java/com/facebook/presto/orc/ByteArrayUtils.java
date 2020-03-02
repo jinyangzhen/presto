@@ -23,6 +23,9 @@ import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
 
 public class ByteArrayUtils
 {
+    // Constant from MurMur hash.
+    private static final long M = 0xc6a4a7935bd1e995L;
+
     private static final Unsafe unsafe;
 
     static {
@@ -45,33 +48,39 @@ public class ByteArrayUtils
     // Adapted from io.airlift.slice.Slice
     public static int compareRanges(byte[] left, int leftOffset, int leftLength, byte[] right, int rightOffset, int rightLength)
     {
-        int minLength = min(leftLength, rightLength);
-        int i = 0;
-        if (minLength >= SIZE_OF_LONG) {
-            while (i < minLength) {
-                long leftLong = unsafe.getLong(left, (long) ARRAY_BYTE_BASE_OFFSET + leftOffset + i);
-                long rightLong = unsafe.getLong(right, (long) ARRAY_BYTE_BASE_OFFSET + rightOffset + i);
+        long leftAddress = ARRAY_BYTE_BASE_OFFSET + leftOffset;
+        long rightAddress = ARRAY_BYTE_BASE_OFFSET + rightOffset;
 
-                if (leftLong != rightLong) {
-                    return longBytesToLong(leftLong) < longBytesToLong(rightLong) ? -1 : 1;
-                }
+        int lengthToCompare = min(leftLength, rightLength);
+        while (lengthToCompare >= SIZE_OF_LONG) {
+            long leftLong = unsafe.getLong(left, leftAddress);
+            long rightLong = unsafe.getLong(right, rightAddress);
 
-                i += SIZE_OF_LONG;
+            if (leftLong != rightLong) {
+                return longBytesToLong(leftLong) < longBytesToLong(rightLong) ? -1 : 1;
             }
-            i -= SIZE_OF_LONG;
+
+            leftAddress += SIZE_OF_LONG;
+            rightAddress += SIZE_OF_LONG;
+            lengthToCompare -= SIZE_OF_LONG;
         }
 
-        while (i < minLength) {
-            int leftByte = Byte.toUnsignedInt(left[leftOffset + i]);
-            int rightByte = Byte.toUnsignedInt(right[rightOffset + i]);
-
-            if (leftByte != rightByte) {
-                return leftByte - rightByte;
+        while (lengthToCompare > 0) {
+            int compareResult = compareUnsignedBytes(unsafe.getByte(left, leftAddress), unsafe.getByte(right, rightAddress));
+            if (compareResult != 0) {
+                return compareResult;
             }
-            i++;
+            leftAddress++;
+            rightAddress++;
+            lengthToCompare--;
         }
 
         return Integer.compare(leftLength, rightLength);
+    }
+
+    private static int compareUnsignedBytes(byte thisByte, byte thatByte)
+    {
+        return Byte.toUnsignedInt(thisByte) - Byte.toUnsignedInt(thatByte);
     }
 
     /**
@@ -82,5 +91,22 @@ public class ByteArrayUtils
     private static long longBytesToLong(long bytes)
     {
         return Long.reverseBytes(bytes) ^ Long.MIN_VALUE;
+    }
+
+    public static long hash(byte[] bytes, int offset, int length)
+    {
+        // Adaptation of Knuth multiplicative hash. Multiplication,
+        // shift and xor. This is approx 3x less arithmetic than
+        // Murmur hash.
+        long seed = 1;
+        int i = 0;
+        for (; i + 8 <= length; i += 8) {
+            seed = (seed * M * unsafe.getLong(bytes, (long) ARRAY_BYTE_BASE_OFFSET + offset + i)) ^ (seed >> 27);
+        }
+        long lastWord = 0;
+        for (; i < length; i++) {
+            lastWord = bytes[offset + i] | (lastWord << 8);
+        }
+        return (seed * M * lastWord) ^ (seed << 27);
     }
 }

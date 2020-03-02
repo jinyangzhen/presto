@@ -14,6 +14,7 @@
 package com.facebook.presto.spi.block;
 
 import io.airlift.slice.Slice;
+import io.airlift.slice.SliceOutput;
 import io.airlift.slice.Slices;
 import org.openjdk.jol.info.ClassLayout;
 
@@ -142,9 +143,9 @@ public class DictionaryBlock
     }
 
     @Override
-    public <T> T getObject(int position, Class<T> clazz)
+    public Block getBlock(int position)
     {
-        return dictionary.getObject(getId(position), clazz);
+        return dictionary.getBlock(getId(position));
     }
 
     @Override
@@ -169,6 +170,12 @@ public class DictionaryBlock
     public void writePositionTo(int position, BlockBuilder blockBuilder)
     {
         dictionary.writePositionTo(getId(position), blockBuilder);
+    }
+
+    @Override
+    public void writePositionTo(int position, SliceOutput output)
+    {
+        dictionary.writePositionTo(getId(position), output);
     }
 
     @Override
@@ -375,7 +382,8 @@ public class DictionaryBlock
     public String toString()
     {
         StringBuilder sb = new StringBuilder("DictionaryBlock{");
-        sb.append("positionCount=").append(getPositionCount());
+        sb.append("positionCount=").append(getPositionCount()).append(",");
+        sb.append("dictionary=").append(dictionary.toString());
         sb.append('}');
         return sb.toString();
     }
@@ -399,6 +407,11 @@ public class DictionaryBlock
     Slice getIds()
     {
         return Slices.wrappedIntArray(ids, idsOffset, positionCount);
+    }
+
+    int[] getRawIds()
+    {
+        return ids;
     }
 
     public int getId(int position)
@@ -519,7 +532,7 @@ public class DictionaryBlock
     public Block getBlockUnchecked(int internalPosition)
     {
         assert internalPositionInRange(internalPosition, getOffsetBase(), getPositionCount());
-        return dictionary.getObject(ids[internalPosition], Block.class);
+        return dictionary.getBlock(ids[internalPosition]);
     }
 
     @Override

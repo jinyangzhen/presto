@@ -20,6 +20,7 @@ import com.facebook.presto.operator.aggregation.SumDataSizeForStats;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.function.FunctionHandle;
 import com.facebook.presto.spi.function.StandardFunctionResolution;
+import com.facebook.presto.spi.plan.AggregationNode;
 import com.facebook.presto.spi.relation.CallExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.spi.statistics.ColumnStatisticMetadata;
@@ -28,7 +29,6 @@ import com.facebook.presto.spi.statistics.TableStatisticType;
 import com.facebook.presto.spi.statistics.TableStatisticsMetadata;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.analyzer.TypeSignatureProvider;
-import com.facebook.presto.sql.planner.plan.AggregationNode;
 import com.facebook.presto.sql.planner.plan.StatisticAggregations;
 import com.facebook.presto.sql.planner.plan.StatisticAggregationsDescriptor;
 import com.facebook.presto.sql.relational.FunctionResolution;
@@ -52,12 +52,12 @@ import static java.util.Objects.requireNonNull;
 
 public class StatisticsAggregationPlanner
 {
-    private final SymbolAllocator symbolAllocator;
+    private final PlanVariableAllocator variableAllocator;
     private final Metadata metadata;
 
-    public StatisticsAggregationPlanner(SymbolAllocator symbolAllocator, Metadata metadata)
+    public StatisticsAggregationPlanner(PlanVariableAllocator variableAllocator, Metadata metadata)
     {
-        this.symbolAllocator = requireNonNull(symbolAllocator, "symbolAllocator is null");
+        this.variableAllocator = requireNonNull(variableAllocator, "variableAllocator is null");
         this.metadata = requireNonNull(metadata, "metadata is null");
     }
 
@@ -90,7 +90,7 @@ public class StatisticsAggregationPlanner
                     Optional.empty(),
                     false,
                     Optional.empty());
-            VariableReferenceExpression variable = symbolAllocator.newVariable("rowCount", BIGINT);
+            VariableReferenceExpression variable = variableAllocator.newVariable("rowCount", BIGINT);
             aggregations.put(variable, aggregation);
             descriptor.addTableStatistic(ROW_COUNT, variable);
         }
@@ -101,7 +101,7 @@ public class StatisticsAggregationPlanner
             VariableReferenceExpression inputVariable = columnToVariableMap.get(columnName);
             verify(inputVariable != null, "inputVariable is null");
             ColumnStatisticsAggregation aggregation = createColumnAggregation(statisticType, inputVariable);
-            VariableReferenceExpression variable = symbolAllocator.newVariable(statisticType + ":" + columnName, aggregation.getOutputType());
+            VariableReferenceExpression variable = variableAllocator.newVariable(statisticType + ":" + columnName, aggregation.getOutputType());
             aggregations.put(variable, aggregation.getAggregation());
             descriptor.addColumnStatistic(columnStatisticMetadata, variable);
         }

@@ -14,6 +14,7 @@
 
 package com.facebook.presto.orc;
 
+import com.facebook.presto.orc.cache.StorageOrcFileTailSource;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.Page;
 import com.facebook.presto.spi.block.Block;
@@ -44,6 +45,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static com.facebook.presto.hive.HiveFileContext.DEFAULT_HIVE_FILE_CONTEXT;
 import static com.facebook.presto.memory.context.AggregatedMemoryContext.newSimpleAggregatedMemoryContext;
 import static com.facebook.presto.orc.OrcEncoding.ORC;
 import static com.facebook.presto.orc.OrcTester.HIVE_STORAGE_TIME_ZONE;
@@ -153,7 +155,7 @@ public class TestStructBatchStreamReader
     }
 
     @Test(expectedExceptions = IllegalArgumentException.class, expectedExceptionsMessageRegExp =
-            "Missing struct field name in type row\\(varchar,varchar,varchar\\)")
+            "ROW type does not have field names declared: row\\(varchar,varchar,varchar\\)")
     public void testThrowsExceptionWhenFieldNameMissing()
             throws IOException
     {
@@ -263,15 +265,31 @@ public class TestStructBatchStreamReader
     {
         DataSize dataSize = new DataSize(1, MEGABYTE);
         OrcDataSource orcDataSource = new FileOrcDataSource(tempFile.getFile(), dataSize, dataSize, dataSize, true);
-        OrcReader orcReader = new OrcReader(orcDataSource, ORC, dataSize, dataSize, dataSize, dataSize);
+        OrcReader orcReader = new OrcReader(
+                orcDataSource,
+                ORC,
+                new StorageOrcFileTailSource(),
+                new StorageStripeMetadataSource(),
+                new OrcReaderOptions(
+                        dataSize,
+                        dataSize,
+                        dataSize,
+                        false),
+                DEFAULT_HIVE_FILE_CONTEXT);
 
         Map<Integer, Type> includedColumns = new HashMap<>();
         includedColumns.put(0, readerType);
 
-        OrcBatchRecordReader recordReader = orcReader.createBatchRecordReader(includedColumns, OrcPredicate.TRUE, UTC, newSimpleAggregatedMemoryContext(), OrcReader.INITIAL_BATCH_SIZE);
+        OrcBatchRecordReader recordReader = orcReader.createBatchRecordReader(
+                includedColumns,
+                OrcPredicate.TRUE,
+                UTC,
+                newSimpleAggregatedMemoryContext(),
+                OrcReader.INITIAL_BATCH_SIZE,
+                DEFAULT_HIVE_FILE_CONTEXT);
 
         recordReader.nextBatch();
-        RowBlock block = (RowBlock) recordReader.readBlock(readerType, 0);
+        RowBlock block = (RowBlock) recordReader.readBlock(0);
         recordReader.close();
         return block;
     }

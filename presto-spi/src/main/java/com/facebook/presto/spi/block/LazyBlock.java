@@ -14,6 +14,7 @@
 package com.facebook.presto.spi.block;
 
 import io.airlift.slice.Slice;
+import io.airlift.slice.SliceOutput;
 import org.openjdk.jol.info.ClassLayout;
 
 import java.util.function.BiConsumer;
@@ -92,10 +93,10 @@ public class LazyBlock
     }
 
     @Override
-    public <T> T getObject(int position, Class<T> clazz)
+    public Block getBlock(int position)
     {
         assureLoaded();
-        return block.getObject(position, clazz);
+        return block.getBlock(position);
     }
 
     @Override
@@ -129,6 +130,13 @@ public class LazyBlock
     {
         assureLoaded();
         block.writePositionTo(position, blockBuilder);
+    }
+
+    @Override
+    public void writePositionTo(int position, SliceOutput output)
+    {
+        assureLoaded();
+        block.writePositionTo(position, output);
     }
 
     @Override
@@ -343,7 +351,7 @@ public class LazyBlock
     public Block getBlockUnchecked(int internalPosition)
     {
         assert block != null : "block is not loaded";
-        return block.getObject(internalPosition, Block.class);
+        return block.getBlock(internalPosition);
     }
 
     @Override

@@ -191,8 +191,9 @@ public class TestingMetadata
     }
 
     @Override
-    public void createView(ConnectorSession session, SchemaTableName viewName, String viewData, boolean replace)
+    public void createView(ConnectorSession session, ConnectorTableMetadata viewMetadata, String viewData, boolean replace)
     {
+        SchemaTableName viewName = viewMetadata.getTable();
         if (replace) {
             views.put(viewName, viewData);
         }
@@ -320,6 +321,25 @@ public class TestingMetadata
         public SchemaTableName getTableName()
         {
             return tableName;
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+            if (this == o) {
+                return true;
+            }
+            if (!(o instanceof TestingTableHandle)) {
+                return false;
+            }
+            TestingTableHandle other = (TestingTableHandle) o;
+            return Objects.equals(tableName, other.tableName);
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return Objects.hash(tableName);
         }
     }
 

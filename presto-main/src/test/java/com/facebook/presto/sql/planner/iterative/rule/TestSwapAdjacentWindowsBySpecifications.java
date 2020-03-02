@@ -75,10 +75,10 @@ public class TestSwapAdjacentWindowsBySpecifications
     {
         tester().assertThat(new GatherAndMergeWindows.SwapAdjacentWindowsBySpecifications(0))
                 .on(p -> p.window(new WindowNode.Specification(
-                                ImmutableList.of(p.variable(p.symbol("a"))),
+                                ImmutableList.of(p.variable("a")),
                                 Optional.empty()),
-                        ImmutableMap.of(p.variable(p.symbol("avg_1")),
-                                new WindowNode.Function(call("avg", functionHandle, DOUBLE, ImmutableList.of()), frame)),
+                        ImmutableMap.of(p.variable("avg_1"),
+                                new WindowNode.Function(call("avg", functionHandle, DOUBLE, ImmutableList.of()), frame, false)),
                         p.values(p.variable("a"))))
                 .doesNotFire();
     }
@@ -98,13 +98,13 @@ public class TestSwapAdjacentWindowsBySpecifications
         tester().assertThat(new GatherAndMergeWindows.SwapAdjacentWindowsBySpecifications(0))
                 .on(p ->
                         p.window(new WindowNode.Specification(
-                                        ImmutableList.of(p.variable(p.symbol("a"))),
+                                        ImmutableList.of(p.variable("a")),
                                         Optional.empty()),
-                                ImmutableMap.of(p.variable(p.symbol("avg_1", DOUBLE)), newWindowNodeFunction(ImmutableList.of(new Symbol("a")))),
+                                ImmutableMap.of(p.variable("avg_1", DOUBLE), newWindowNodeFunction(ImmutableList.of(new Symbol("a")))),
                                 p.window(new WindowNode.Specification(
-                                                ImmutableList.of(p.variable(p.symbol("a")), p.variable(p.symbol("b"))),
+                                                ImmutableList.of(p.variable("a"), p.variable("b")),
                                                 Optional.empty()),
-                                        ImmutableMap.of(p.variable(p.symbol("avg_2", DOUBLE)), newWindowNodeFunction(ImmutableList.of(new Symbol("b")))),
+                                        ImmutableMap.of(p.variable("avg_2", DOUBLE), newWindowNodeFunction(ImmutableList.of(new Symbol("b")))),
                                         p.values(p.variable("a"), p.variable("b")))))
                 .matches(
                         window(windowMatcherBuilder -> windowMatcherBuilder
@@ -124,13 +124,13 @@ public class TestSwapAdjacentWindowsBySpecifications
         tester().assertThat(new GatherAndMergeWindows.SwapAdjacentWindowsBySpecifications(0))
                 .on(p ->
                         p.window(new WindowNode.Specification(
-                                        ImmutableList.of(p.variable(p.symbol("a"))),
+                                        ImmutableList.of(p.variable("a")),
                                         Optional.empty()),
-                                ImmutableMap.of(p.variable(p.symbol("avg_1")), newWindowNodeFunction(ImmutableList.of(new Symbol("avg_2")))),
+                                ImmutableMap.of(p.variable("avg_1"), newWindowNodeFunction(ImmutableList.of(new Symbol("avg_2")))),
                                 p.window(new WindowNode.Specification(
-                                                ImmutableList.of(p.variable(p.symbol("a")), p.variable(p.symbol("b"))),
+                                                ImmutableList.of(p.variable("a"), p.variable("b")),
                                                 Optional.empty()),
-                                        ImmutableMap.of(p.variable(p.symbol("avg_2")), newWindowNodeFunction(ImmutableList.of(new Symbol("a")))),
+                                        ImmutableMap.of(p.variable("avg_2"), newWindowNodeFunction(ImmutableList.of(new Symbol("a")))),
                                         p.values(p.variable("a"), p.variable("b")))))
                 .doesNotFire();
     }
@@ -139,6 +139,7 @@ public class TestSwapAdjacentWindowsBySpecifications
     {
         return new WindowNode.Function(
                 call("avg", functionHandle, BIGINT, symbols.stream().map(symbol -> new VariableReferenceExpression(symbol.getName(), BIGINT)).collect(Collectors.toList())),
-                frame);
+                frame,
+                false);
     }
 }

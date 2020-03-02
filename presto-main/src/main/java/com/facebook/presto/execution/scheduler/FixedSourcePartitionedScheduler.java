@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.execution.scheduler;
 
+import com.facebook.airlift.log.Logger;
 import com.facebook.presto.execution.Lifespan;
 import com.facebook.presto.execution.RemoteTask;
 import com.facebook.presto.execution.SqlStageExecution;
@@ -21,6 +22,7 @@ import com.facebook.presto.execution.scheduler.ScheduleResult.BlockedReason;
 import com.facebook.presto.execution.scheduler.group.DynamicLifespanScheduler;
 import com.facebook.presto.execution.scheduler.group.FixedLifespanScheduler;
 import com.facebook.presto.execution.scheduler.group.LifespanScheduler;
+import com.facebook.presto.execution.scheduler.nodeSelection.NodeSelector;
 import com.facebook.presto.metadata.InternalNode;
 import com.facebook.presto.metadata.Split;
 import com.facebook.presto.operator.StageExecutionDescriptor;
@@ -31,7 +33,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Streams;
 import com.google.common.util.concurrent.ListenableFuture;
-import io.airlift.log.Logger;
+
+import javax.annotation.concurrent.GuardedBy;
 
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -39,16 +42,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Supplier;
 
+import static com.facebook.airlift.concurrent.MoreFutures.whenAnyComplete;
 import static com.facebook.presto.execution.scheduler.SourcePartitionedScheduler.newSourcePartitionedSchedulerAsSourceScheduler;
 import static com.facebook.presto.spi.connector.NotPartitionedPartitionHandle.NOT_PARTITIONED;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.ImmutableList.toImmutableList;
-import static io.airlift.concurrent.MoreFutures.whenAnyComplete;
 import static java.lang.Math.toIntExact;
 import static java.util.Objects.requireNonNull;
 
@@ -59,11 +65,17 @@ public class FixedSourcePartitionedScheduler
 
     private final SqlStageExecution stage;
     private final List<InternalNode> nodes;
+
     private final List<SourceScheduler> sourceSchedulers;
     private final List<ConnectorPartitionHandle> partitionHandles;
     private boolean scheduledTasks;
     private boolean anySourceSchedulingFinished;
     private final Optional<LifespanScheduler> groupedLifespanScheduler;
+
+    private final Queue<Integer> tasksToRecover = new ConcurrentLinkedQueue<>();
+
+    @GuardedBy("this")
+    private boolean closed;
 
     public FixedSourcePartitionedScheduler(
             SqlStageExecution stage,
@@ -150,7 +162,10 @@ public class FixedSourcePartitionedScheduler
             }
         }
         this.groupedLifespanScheduler = groupedLifespanScheduler;
-        this.sourceSchedulers = sourceSchedulers;
+
+        // use a CopyOnWriteArrayList to prevent ConcurrentModificationExceptions
+        // if close() is called while the main thread is in the scheduling loop
+        this.sourceSchedulers = new CopyOnWriteArrayList<>(sourceSchedulers);
     }
 
     private ConnectorPartitionHandle partitionHandleFor(Lifespan lifespan)
@@ -161,17 +176,15 @@ public class FixedSourcePartitionedScheduler
         return partitionHandles.get(lifespan.getId());
     }
 
-    // Only schedule() and recover() are synchronized
     @Override
-    public synchronized ScheduleResult schedule()
+    public ScheduleResult schedule()
     {
         // schedule a task on every node in the distribution
         List<RemoteTask> newTasks = ImmutableList.of();
         if (!scheduledTasks) {
-            OptionalInt totalPartitions = OptionalInt.of(nodes.size());
             newTasks = Streams.mapWithIndex(
                     nodes.stream(),
-                    (node, id) -> stage.scheduleTask(node, toIntExact(id), totalPartitions))
+                    (node, id) -> stage.scheduleTask(node, toIntExact(id)))
                     .filter(Optional::isPresent)
                     .map(Optional::get)
                     .collect(toImmutableList());
@@ -186,6 +199,13 @@ public class FixedSourcePartitionedScheduler
         BlockedReason blockedReason = BlockedReason.NO_ACTIVE_DRIVER_GROUP;
 
         if (groupedLifespanScheduler.isPresent()) {
+            while (!tasksToRecover.isEmpty()) {
+                if (anySourceSchedulingFinished) {
+                    throw new IllegalStateException("Recover after any source scheduling finished is not supported");
+                }
+                groupedLifespanScheduler.get().onTaskFailed(tasksToRecover.poll(), sourceSchedulers);
+            }
+
             if (groupedLifespanScheduler.get().allLifespanExecutionFinished()) {
                 for (SourceScheduler sourceScheduler : sourceSchedulers) {
                     sourceScheduler.notifyAllLifespansFinishedExecution();
@@ -205,33 +225,40 @@ public class FixedSourcePartitionedScheduler
         Iterator<SourceScheduler> schedulerIterator = sourceSchedulers.iterator();
         List<Lifespan> driverGroupsToStart = ImmutableList.of();
         while (schedulerIterator.hasNext()) {
-            SourceScheduler sourceScheduler = schedulerIterator.next();
+            synchronized (this) {
+                // if a source scheduler is closed while it is scheduling, we can get an error
+                // prevent that by checking if scheduling has been cancelled first.
+                if (closed) {
+                    break;
+                }
+                SourceScheduler sourceScheduler = schedulerIterator.next();
 
-            for (Lifespan lifespan : driverGroupsToStart) {
-                sourceScheduler.startLifespan(lifespan, partitionHandleFor(lifespan));
-            }
+                for (Lifespan lifespan : driverGroupsToStart) {
+                    sourceScheduler.startLifespan(lifespan, partitionHandleFor(lifespan));
+                }
 
-            ScheduleResult schedule = sourceScheduler.schedule();
-            if (schedule.getSplitsScheduled() > 0) {
-                stage.transitionToSchedulingSplits();
-            }
-            splitsScheduled += schedule.getSplitsScheduled();
-            if (schedule.getBlockedReason().isPresent()) {
-                blocked.add(schedule.getBlocked());
-                blockedReason = blockedReason.combineWith(schedule.getBlockedReason().get());
-            }
-            else {
-                verify(schedule.getBlocked().isDone(), "blockedReason not provided when scheduler is blocked");
-                allBlocked = false;
-            }
+                ScheduleResult schedule = sourceScheduler.schedule();
+                if (schedule.getSplitsScheduled() > 0) {
+                    stage.transitionToSchedulingSplits();
+                }
+                splitsScheduled += schedule.getSplitsScheduled();
+                if (schedule.getBlockedReason().isPresent()) {
+                    blocked.add(schedule.getBlocked());
+                    blockedReason = blockedReason.combineWith(schedule.getBlockedReason().get());
+                }
+                else {
+                    verify(schedule.getBlocked().isDone(), "blockedReason not provided when scheduler is blocked");
+                    allBlocked = false;
+                }
 
-            driverGroupsToStart = sourceScheduler.drainCompletelyScheduledLifespans();
+                driverGroupsToStart = sourceScheduler.drainCompletelyScheduledLifespans();
 
-            if (schedule.isFinished()) {
-                stage.schedulingComplete(sourceScheduler.getPlanNodeId());
-                schedulerIterator.remove();
-                sourceScheduler.close();
-                anySourceSchedulingFinished = true;
+                if (schedule.isFinished()) {
+                    stage.schedulingComplete(sourceScheduler.getPlanNodeId());
+                    sourceSchedulers.remove(sourceScheduler);
+                    sourceScheduler.close();
+                    anySourceSchedulingFinished = true;
+                }
             }
         }
 
@@ -243,20 +270,15 @@ public class FixedSourcePartitionedScheduler
         }
     }
 
-    // Only schedule() and recover() are synchronized
-    public synchronized void recover(TaskId taskId)
+    public void recover(TaskId taskId)
     {
-        checkState(groupedLifespanScheduler.isPresent(), "groupedLifespanScheduler is not present for recoverable grouped execution");
-        if (anySourceSchedulingFinished) {
-            throw new IllegalStateException("Recover after any source scheduling finished is not supported");
-        }
-
-        groupedLifespanScheduler.get().onTaskFailed(taskId.getId(), sourceSchedulers);
+        tasksToRecover.add(taskId.getId());
     }
 
     @Override
-    public void close()
+    public synchronized void close()
     {
+        closed = true;
         for (SourceScheduler sourceScheduler : sourceSchedulers) {
             try {
                 sourceScheduler.close();

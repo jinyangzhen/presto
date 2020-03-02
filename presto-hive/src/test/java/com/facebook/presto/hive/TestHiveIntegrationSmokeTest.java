@@ -36,6 +36,7 @@ import com.facebook.presto.sql.planner.Plan;
 import com.facebook.presto.sql.planner.plan.ExchangeNode;
 import com.facebook.presto.sql.planner.plan.MarkDistinctNode;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
+import com.facebook.presto.sql.planner.plan.TableWriterMergeNode;
 import com.facebook.presto.sql.planner.plan.TopNRowNumberNode;
 import com.facebook.presto.sql.planner.plan.WindowNode;
 import com.facebook.presto.sql.planner.planPrinter.IOPlanPrinter.ColumnConstraint;
@@ -46,6 +47,7 @@ import com.facebook.presto.sql.planner.planPrinter.IOPlanPrinter.IOPlan;
 import com.facebook.presto.sql.planner.planPrinter.IOPlanPrinter.IOPlan.TableColumnInfo;
 import com.facebook.presto.testing.MaterializedResult;
 import com.facebook.presto.testing.MaterializedRow;
+import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.tests.AbstractTestIntegrationSmokeTest;
 import com.facebook.presto.tests.DistributedQueryRunner;
 import com.google.common.collect.ImmutableList;
@@ -69,6 +71,7 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.LongStream;
 
+import static com.facebook.airlift.json.JsonCodec.jsonCodec;
 import static com.facebook.presto.SystemSessionProperties.COLOCATED_JOIN;
 import static com.facebook.presto.SystemSessionProperties.CONCURRENT_LIFESPANS_PER_NODE;
 import static com.facebook.presto.SystemSessionProperties.DYNAMIC_SCHEDULE_FOR_GROUPED_EXECUTION;
@@ -87,13 +90,17 @@ import static com.facebook.presto.hive.HiveQueryRunner.createMaterializeExchange
 import static com.facebook.presto.hive.HiveQueryRunner.createQueryRunner;
 import static com.facebook.presto.hive.HiveSessionProperties.PUSHDOWN_FILTER_ENABLED;
 import static com.facebook.presto.hive.HiveSessionProperties.RCFILE_OPTIMIZED_WRITER_ENABLED;
+import static com.facebook.presto.hive.HiveSessionProperties.SORTED_WRITE_TEMP_PATH_SUBDIRECTORY_COUNT;
+import static com.facebook.presto.hive.HiveSessionProperties.SORTED_WRITE_TO_TEMP_PATH_ENABLED;
 import static com.facebook.presto.hive.HiveSessionProperties.getInsertExistingPartitionsBehavior;
+import static com.facebook.presto.hive.HiveSessionProperties.isPushdownFilterEnabled;
 import static com.facebook.presto.hive.HiveTableProperties.BUCKETED_BY_PROPERTY;
 import static com.facebook.presto.hive.HiveTableProperties.BUCKET_COUNT_PROPERTY;
 import static com.facebook.presto.hive.HiveTableProperties.PARTITIONED_BY_PROPERTY;
 import static com.facebook.presto.hive.HiveTableProperties.STORAGE_FORMAT_PROPERTY;
 import static com.facebook.presto.hive.HiveTestUtils.TYPE_MANAGER;
 import static com.facebook.presto.hive.HiveUtil.columnExtraInfo;
+import static com.facebook.presto.spi.predicate.Marker.Bound.ABOVE;
 import static com.facebook.presto.spi.predicate.Marker.Bound.EXACTLY;
 import static com.facebook.presto.spi.security.SelectedRole.Type.ROLE;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
@@ -123,7 +130,6 @@ import static com.google.common.io.Files.asCharSink;
 import static com.google.common.io.Files.createTempDir;
 import static com.google.common.io.MoreFiles.deleteRecursively;
 import static com.google.common.io.RecursiveDeleteOption.ALLOW_INSECURE;
-import static io.airlift.json.JsonCodec.jsonCodec;
 import static io.airlift.tpch.TpchTable.CUSTOMER;
 import static io.airlift.tpch.TpchTable.LINE_ITEM;
 import static io.airlift.tpch.TpchTable.ORDERS;
@@ -183,7 +189,7 @@ public class TestHiveIntegrationSmokeTest
     public void testSchemaOperations()
     {
         Session admin = Session.builder(getQueryRunner().getDefaultSession())
-                .setIdentity(new Identity("hive", Optional.empty(), ImmutableMap.of("hive", new SelectedRole(SelectedRole.Type.ROLE, Optional.of("admin")))))
+                .setIdentity(new Identity("hive", Optional.empty(), ImmutableMap.of("hive", new SelectedRole(SelectedRole.Type.ROLE, Optional.of("admin"))), ImmutableMap.of()))
                 .build();
 
         assertUpdate(admin, "CREATE SCHEMA new_schema");
@@ -204,39 +210,73 @@ public class TestHiveIntegrationSmokeTest
         computeActual("CREATE TABLE test_orders WITH (partitioned_by = ARRAY['orderkey', 'processing']) AS SELECT custkey, orderkey, orderstatus = 'P' processing FROM orders WHERE orderkey < 3");
 
         MaterializedResult result = computeActual("EXPLAIN (TYPE IO, FORMAT JSON) INSERT INTO test_orders SELECT custkey, orderkey, processing FROM test_orders where custkey <= 10");
+        ImmutableSet.Builder<ColumnConstraint> expectedConstraints = ImmutableSet.builder();
+        expectedConstraints.add(new ColumnConstraint(
+                "orderkey",
+                BIGINT.getTypeSignature(),
+                new FormattedDomain(
+                        false,
+                        ImmutableSet.of(
+                                new FormattedRange(
+                                        new FormattedMarker(Optional.of("1"), EXACTLY),
+                                        new FormattedMarker(Optional.of("1"), EXACTLY)),
+                                new FormattedRange(
+                                        new FormattedMarker(Optional.of("2"), EXACTLY),
+                                        new FormattedMarker(Optional.of("2"), EXACTLY))))));
+        expectedConstraints.add(new ColumnConstraint(
+                "processing",
+                BOOLEAN.getTypeSignature(),
+                new FormattedDomain(
+                        false,
+                        ImmutableSet.of(
+                                new FormattedRange(
+                                        new FormattedMarker(Optional.of("false"), EXACTLY),
+                                        new FormattedMarker(Optional.of("false"), EXACTLY))))));
+        if (isPushdownFilterEnabled(getConnectorSession(getSession()))) {
+            expectedConstraints.add(new ColumnConstraint(
+                    "custkey",
+                    BIGINT.getTypeSignature(),
+                    new FormattedDomain(
+                            false,
+                            ImmutableSet.of(
+                                    new FormattedRange(
+                                            new FormattedMarker(Optional.empty(), ABOVE),
+                                            new FormattedMarker(Optional.of("10"), EXACTLY))))));
+        }
         assertEquals(
                 jsonCodec(IOPlan.class).fromJson((String) getOnlyElement(result.getOnlyColumnAsSet())),
                 new IOPlan(
                         ImmutableSet.of(new TableColumnInfo(
                                 new CatalogSchemaTableName(catalog, "tpch", "test_orders"),
-                                ImmutableSet.of(
-                                        new ColumnConstraint(
-                                                "orderkey",
-                                                BIGINT.getTypeSignature(),
-                                                new FormattedDomain(
-                                                        false,
-                                                        ImmutableSet.of(
-                                                                new FormattedRange(
-                                                                        new FormattedMarker(Optional.of("1"), EXACTLY),
-                                                                        new FormattedMarker(Optional.of("1"), EXACTLY)),
-                                                                new FormattedRange(
-                                                                        new FormattedMarker(Optional.of("2"), EXACTLY),
-                                                                        new FormattedMarker(Optional.of("2"), EXACTLY))))),
-                                        new ColumnConstraint(
-                                                "processing",
-                                                BOOLEAN.getTypeSignature(),
-                                                new FormattedDomain(
-                                                        false,
-                                                        ImmutableSet.of(
-                                                                new FormattedRange(
-                                                                        new FormattedMarker(Optional.of("false"), EXACTLY),
-                                                                        new FormattedMarker(Optional.of("false"), EXACTLY)))))))),
+                                expectedConstraints.build())),
                         Optional.of(new CatalogSchemaTableName(catalog, "tpch", "test_orders"))));
 
         assertUpdate("DROP TABLE test_orders");
 
-        // Test IO explain with large number of discrete components where Domain::simpify comes into play.
+        // Test IO explain with large number of discrete components where Domain::simplify comes into play.
         computeActual("CREATE TABLE test_orders WITH (partitioned_by = ARRAY['orderkey']) AS select custkey, orderkey FROM orders where orderkey < 200");
+
+        expectedConstraints = ImmutableSet.builder();
+        expectedConstraints.add(new ColumnConstraint(
+                "orderkey",
+                BIGINT.getTypeSignature(),
+                new FormattedDomain(
+                        false,
+                        ImmutableSet.of(
+                                new FormattedRange(
+                                        new FormattedMarker(Optional.of("1"), EXACTLY),
+                                        new FormattedMarker(Optional.of("199"), EXACTLY))))));
+        if (isPushdownFilterEnabled(getConnectorSession(getSession()))) {
+            expectedConstraints.add(new ColumnConstraint(
+                    "custkey",
+                    BIGINT.getTypeSignature(),
+                    new FormattedDomain(
+                            false,
+                            ImmutableSet.of(
+                                    new FormattedRange(
+                                            new FormattedMarker(Optional.empty(), ABOVE),
+                                            new FormattedMarker(Optional.of("10"), EXACTLY))))));
+        }
 
         result = computeActual("EXPLAIN (TYPE IO, FORMAT JSON) INSERT INTO test_orders SELECT custkey, orderkey + 10 FROM test_orders where custkey <= 10");
         assertEquals(
@@ -244,16 +284,7 @@ public class TestHiveIntegrationSmokeTest
                 new IOPlan(
                         ImmutableSet.of(new TableColumnInfo(
                                 new CatalogSchemaTableName(catalog, "tpch", "test_orders"),
-                                ImmutableSet.of(
-                                        new ColumnConstraint(
-                                                "orderkey",
-                                                BIGINT.getTypeSignature(),
-                                                new FormattedDomain(
-                                                        false,
-                                                        ImmutableSet.of(
-                                                                new FormattedRange(
-                                                                        new FormattedMarker(Optional.of("1"), EXACTLY),
-                                                                        new FormattedMarker(Optional.of("199"), EXACTLY)))))))),
+                                expectedConstraints.build())),
                         Optional.of(new CatalogSchemaTableName(catalog, "tpch", "test_orders"))));
 
         assertUpdate("DROP TABLE test_orders");
@@ -628,6 +659,50 @@ public class TestHiveIntegrationSmokeTest
         assertUpdate(session, "DROP TABLE test_create_partitioned_table_as");
 
         assertFalse(getQueryRunner().tableExists(session, "test_create_partitioned_table_as"));
+    }
+
+    @Test
+    public void testCreatePartitionedTableAsShuffleOnPartitionColumns()
+    {
+        testCreatePartitionedTableAsShuffleOnPartitionColumns(
+                Session.builder(getSession())
+                        .setSystemProperty("task_writer_count", "1")
+                        .setCatalogSessionProperty(catalog, "shuffle_partitioned_columns_for_table_write", "true")
+                        .build(),
+                HiveStorageFormat.ORC);
+    }
+
+    public void testCreatePartitionedTableAsShuffleOnPartitionColumns(Session session, HiveStorageFormat storageFormat)
+    {
+        @Language("SQL") String createTable = "" +
+                "CREATE TABLE test_create_partitioned_table_as_shuffle_on_partition_columns " +
+                "WITH (" +
+                "format = '" + storageFormat + "', " +
+                "partitioned_by = ARRAY[ 'SHIP_PRIORITY', 'ORDER_STATUS' ]" +
+                ") " +
+                "AS " +
+                "SELECT orderkey AS order_key, shippriority AS ship_priority, orderstatus AS order_status " +
+                "FROM tpch.tiny.orders";
+
+        assertUpdate(session, createTable, "SELECT count(*) from orders");
+
+        TableMetadata tableMetadata = getTableMetadata(catalog, TPCH_SCHEMA, "test_create_partitioned_table_as_shuffle_on_partition_columns");
+        assertEquals(tableMetadata.getMetadata().getProperties().get(STORAGE_FORMAT_PROPERTY), storageFormat);
+        assertEquals(tableMetadata.getMetadata().getProperties().get(PARTITIONED_BY_PROPERTY), ImmutableList.of("ship_priority", "order_status"));
+
+        List<?> partitions = getPartitions("test_create_partitioned_table_as_shuffle_on_partition_columns");
+        assertEquals(partitions.size(), 3);
+
+        assertQuery(
+                session,
+                "SELECT count(distinct \"$path\") from test_create_partitioned_table_as_shuffle_on_partition_columns",
+                "SELECT 3");
+
+        assertQuery(session, "SELECT * from test_create_partitioned_table_as_shuffle_on_partition_columns", "SELECT orderkey, shippriority, orderstatus FROM orders");
+
+        assertUpdate(session, "DROP TABLE test_create_partitioned_table_as_shuffle_on_partition_columns");
+
+        assertFalse(getQueryRunner().tableExists(session, "test_create_partitioned_table_as_shuffle_on_partition_columns"));
     }
 
     @Test(expectedExceptions = RuntimeException.class, expectedExceptionsMessageRegExp = "Partition keys must be the last columns in the table and in the same order as the table properties.*")
@@ -1298,6 +1373,65 @@ public class TestHiveIntegrationSmokeTest
     }
 
     @Test
+    public void testInsertPartitionedTableShuffleOnPartitionColumns()
+    {
+        testInsertPartitionedTableShuffleOnPartitionColumns(
+                Session.builder(getSession())
+                        .setSystemProperty("task_writer_count", "1")
+                        .setCatalogSessionProperty(catalog, "shuffle_partitioned_columns_for_table_write", "true")
+                        .build(),
+                HiveStorageFormat.ORC);
+    }
+
+    public void testInsertPartitionedTableShuffleOnPartitionColumns(Session session, HiveStorageFormat storageFormat)
+    {
+        String tableName = "test_insert_partitioned_table_shuffle_on_partition_columns";
+
+        @Language("SQL") String createTable = "" +
+                "CREATE TABLE " + tableName + " " +
+                "(" +
+                "  order_key BIGINT," +
+                "  comment VARCHAR," +
+                "  order_status VARCHAR" +
+                ") " +
+                "WITH (" +
+                "format = '" + storageFormat + "', " +
+                "partitioned_by = ARRAY[ 'order_status' ]" +
+                ") ";
+
+        assertUpdate(session, createTable);
+
+        TableMetadata tableMetadata = getTableMetadata(catalog, TPCH_SCHEMA, tableName);
+        assertEquals(tableMetadata.getMetadata().getProperties().get(STORAGE_FORMAT_PROPERTY), storageFormat);
+        assertEquals(tableMetadata.getMetadata().getProperties().get(PARTITIONED_BY_PROPERTY), ImmutableList.of("order_status"));
+
+        assertUpdate(
+                session,
+                "INSERT INTO " + tableName + " " +
+                        "SELECT orderkey, comment, orderstatus " +
+                        "FROM tpch.tiny.orders",
+                "SELECT count(*) from orders");
+
+        // verify the partitions
+        List<?> partitions = getPartitions(tableName);
+        assertEquals(partitions.size(), 3);
+
+        assertQuery(
+                session,
+                "SELECT * from " + tableName,
+                "SELECT orderkey, comment, orderstatus FROM orders");
+
+        assertQuery(
+                session,
+                "SELECT count(distinct \"$path\") from " + tableName,
+                "SELECT 3");
+
+        assertUpdate(session, "DROP TABLE " + tableName);
+
+        assertFalse(getQueryRunner().tableExists(session, tableName));
+    }
+
+    @Test
     public void testInsertPartitionedTableExistingPartition()
     {
         testWithAllStorageFormats(this::testInsertPartitionedTableExistingPartition);
@@ -1674,6 +1808,15 @@ public class TestHiveIntegrationSmokeTest
 
         assertQuery("SELECT * from test_metadata_delete", "SELECT orderkey, linenumber, linestatus FROM lineitem WHERE linestatus<>'F' or linenumber<>3");
 
+        // TODO This use case can be supported
+        try {
+            getQueryRunner().execute("DELETE FROM test_metadata_delete WHERE lower(LINE_STATUS)='f' and LINE_NUMBER=CAST(4 AS INTEGER)");
+            fail("expected exception");
+        }
+        catch (RuntimeException e) {
+            assertEquals(e.getMessage(), "This connector only supports delete where one or more partitions are deleted entirely");
+        }
+
         assertUpdate("DELETE FROM test_metadata_delete WHERE LINE_STATUS='O'");
 
         assertQuery("SELECT * from test_metadata_delete", "SELECT orderkey, linenumber, linestatus FROM lineitem WHERE linestatus<>'O' and linenumber<>3");
@@ -1912,6 +2055,113 @@ public class TestHiveIntegrationSmokeTest
     }
 
     @Test
+    public void testBucketPruning()
+    {
+        Session session = getSession();
+        QueryRunner queryRunner = getQueryRunner();
+        queryRunner.execute("CREATE TABLE orders_bucketed WITH (bucket_count = 11, bucketed_by = ARRAY['orderkey']) AS " +
+                "SELECT * FROM orders");
+
+        try {
+            assertQuery(session, "SELECT * FROM orders_bucketed WHERE orderkey = 100", "SELECT * FROM orders WHERE orderkey = 100");
+
+            assertQuery(session, "SELECT * FROM orders_bucketed WHERE orderkey = 100 OR orderkey = 101", "SELECT * FROM orders WHERE orderkey = 100 OR orderkey = 101");
+
+            assertQuery(session, "SELECT * FROM orders_bucketed WHERE orderkey IN (100, 101, 133)", "SELECT * FROM orders WHERE orderkey IN (100, 101, 133)");
+
+            assertQuery(session, "SELECT * FROM orders_bucketed", "SELECT * FROM orders");
+
+            assertQuery(session, "SELECT * FROM orders_bucketed WHERE orderkey > 100", "SELECT * FROM orders WHERE orderkey > 100");
+
+            assertQuery(session, "SELECT * FROM orders_bucketed WHERE orderkey != 100", "SELECT * FROM orders WHERE orderkey != 100");
+        }
+        finally {
+            queryRunner.execute("DROP TABLE orders_bucketed");
+        }
+
+        queryRunner.execute("CREATE TABLE orders_bucketed WITH (bucket_count = 11, bucketed_by = ARRAY['orderkey', 'custkey']) AS " +
+                "SELECT * FROM orders");
+
+        try {
+            assertQuery(session, "SELECT * FROM orders_bucketed WHERE orderkey = 101 AND custkey = 280", "SELECT * FROM orders WHERE orderkey = 101 AND custkey = 280");
+
+            assertQuery(session, "SELECT * FROM orders_bucketed WHERE orderkey IN (101, 71) AND custkey = 280", "SELECT * FROM orders WHERE orderkey IN (101, 71) AND custkey = 280");
+
+            assertQuery(session, "SELECT * FROM orders_bucketed WHERE orderkey IN (101, 71) AND custkey IN (280, 34)", "SELECT * FROM orders WHERE orderkey IN (101, 71) AND custkey IN (280, 34)");
+
+            assertQuery(session, "SELECT * FROM orders_bucketed WHERE orderkey = 101 AND custkey = 280 AND orderstatus <> '0'", "SELECT * FROM orders WHERE orderkey = 101 AND custkey = 280 AND orderstatus <> '0'");
+
+            assertQuery(session, "SELECT * FROM orders_bucketed WHERE orderkey = 101", "SELECT * FROM orders WHERE orderkey = 101");
+
+            assertQuery(session, "SELECT * FROM orders_bucketed WHERE custkey = 280", "SELECT * FROM orders WHERE custkey = 280");
+
+            assertQuery(session, "SELECT * FROM orders_bucketed WHERE orderkey = 101 AND custkey > 280", "SELECT * FROM orders WHERE orderkey = 101 AND custkey > 280");
+        }
+        finally {
+            queryRunner.execute("DROP TABLE orders_bucketed");
+        }
+    }
+
+    @Test
+    public void testWriteSortedTable()
+    {
+        testWriteSortedTable(getSession());
+        testWriteSortedTable(Session.builder(getSession())
+                .setCatalogSessionProperty(catalog, SORTED_WRITE_TO_TEMP_PATH_ENABLED, "true")
+                .setCatalogSessionProperty(catalog, SORTED_WRITE_TEMP_PATH_SUBDIRECTORY_COUNT, "10")
+                .build());
+    }
+
+    private void testWriteSortedTable(Session session)
+    {
+        try {
+            // create table
+            assertUpdate(
+                    session,
+                    "CREATE TABLE create_partitioned_sorted_table (orderkey, custkey, totalprice, orderdate, orderpriority, clerk, shippriority, comment, orderstatus)\n" +
+                            "WITH (partitioned_by = ARRAY['orderstatus'], bucketed_by = ARRAY['custkey'], bucket_count = 11, sorted_by = ARRAY['orderkey']) AS\n" +
+                            "SELECT orderkey, custkey, totalprice, orderdate, orderpriority, clerk, shippriority, comment, orderstatus FROM tpch.sf1.orders",
+                    (long) computeActual("SELECT count(*) FROM tpch.sf1.orders").getOnlyValue());
+            assertQuery(
+                    session,
+                    "SELECT count(*) FROM create_partitioned_sorted_table",
+                    "SELECT count(*) * 100 FROM orders");
+
+            assertUpdate(
+                    session,
+                    "CREATE TABLE create_unpartitioned_sorted_table (orderkey, custkey, totalprice, orderdate, orderpriority, clerk, shippriority, comment, orderstatus)\n" +
+                            "WITH (bucketed_by = ARRAY['custkey'], bucket_count = 11, sorted_by = ARRAY['orderkey']) AS\n" +
+                            "SELECT orderkey, custkey, totalprice, orderdate, orderpriority, clerk, shippriority, comment, orderstatus FROM tpch.sf1.orders",
+                    (long) computeActual("SELECT count(*) FROM tpch.sf1.orders").getOnlyValue());
+            assertQuery(
+                    session,
+                    "SELECT count(*) FROM create_unpartitioned_sorted_table",
+                    "SELECT count(*) * 100 FROM orders");
+
+            // insert
+            assertUpdate(
+                    session,
+                    "CREATE TABLE insert_partitioned_sorted_table (LIKE create_partitioned_sorted_table) " +
+                            "WITH (partitioned_by = ARRAY['orderstatus'], bucketed_by = ARRAY['custkey'], bucket_count = 11, sorted_by = ARRAY['orderkey'])");
+
+            assertUpdate(
+                    session,
+                    "INSERT INTO insert_partitioned_sorted_table\n" +
+                            "SELECT orderkey, custkey, totalprice, orderdate, orderpriority, clerk, shippriority, comment, orderstatus FROM tpch.sf1.orders",
+                    (long) computeActual("SELECT count(*) FROM tpch.sf1.orders").getOnlyValue());
+            assertQuery(
+                    session,
+                    "SELECT count(*) FROM insert_partitioned_sorted_table",
+                    "SELECT count(*) * 100 FROM orders");
+        }
+        finally {
+            assertUpdate(session, "DROP TABLE IF EXISTS create_partitioned_sorted_table");
+            assertUpdate(session, "DROP TABLE IF EXISTS create_unpartitioned_sorted_table");
+            assertUpdate(session, "DROP TABLE IF EXISTS insert_partitioned_sorted_table");
+        }
+    }
+
+    @Test
     public void testScaleWriters()
     {
         try {
@@ -1920,6 +2170,7 @@ public class TestHiveIntegrationSmokeTest
                     Session.builder(getSession())
                             .setSystemProperty("scale_writers", "true")
                             .setSystemProperty("writer_min_size", "32MB")
+                            .setSystemProperty("task_writer_count", "1")
                             .build(),
                     "CREATE TABLE scale_writers_small AS SELECT * FROM tpch.tiny.orders",
                     (long) computeActual("SELECT count(*) FROM tpch.tiny.orders").getOnlyValue());
@@ -1931,6 +2182,7 @@ public class TestHiveIntegrationSmokeTest
                     Session.builder(getSession())
                             .setSystemProperty("scale_writers", "true")
                             .setSystemProperty("writer_min_size", "1MB")
+                            .setSystemProperty("task_writer_count", "1")
                             .build(),
                     "CREATE TABLE scale_writers_large WITH (format = 'RCBINARY') AS SELECT * FROM tpch.sf1.orders",
                     (long) computeActual("SELECT count(*) FROM tpch.sf1.orders").getOnlyValue());
@@ -2642,7 +2894,7 @@ public class TestHiveIntegrationSmokeTest
         assertQueryFails(
                 materializeAllWrongPartitioningProvider,
                 "SELECT orderkey, COUNT(*) lines FROM lineitem GROUP BY orderkey",
-                "Catalog \"tpch\" does not support custom partitioning and cannot be used as a partitioning provider");
+                "Catalog \"tpch\" cannot be used as a partitioning provider: This connector does not support custom partitioning");
 
         // make sure that bucketing is not ignored for temporary tables
         Session bucketingIgnored = Session.builder(materializeExchangesSession)
@@ -2796,6 +3048,76 @@ public class TestHiveIntegrationSmokeTest
                         ") " +
                         "GROUP BY partkey",
                 assertRemoteMaterializedExchangesCount(2));
+
+        // union over aggregation + broadcast join
+        Session broadcastJoinMaterializeExchangesSession = Session.builder(materializeExchangesSession)
+                .setSystemProperty(JOIN_DISTRIBUTION_TYPE, BROADCAST.name())
+                .build();
+        Session broadcastJoinStreamingExchangesSession = Session.builder(getSession())
+                .setSystemProperty(JOIN_DISTRIBUTION_TYPE, BROADCAST.name())
+                .build();
+
+        // compatible union partitioning
+        assertQuery(
+                broadcastJoinMaterializeExchangesSession,
+                "WITH union_of_aggregations as ( " +
+                        "    SELECT " +
+                        "        partkey, " +
+                        "        count(*) AS value " +
+                        "    FROM lineitem " +
+                        "    GROUP BY  " +
+                        "        1 " +
+                        "    UNION ALL " +
+                        "    SELECT " +
+                        "        partkey, " +
+                        "        sum(suppkey) AS value " +
+                        "    FROM lineitem " +
+                        "    GROUP BY  " +
+                        "        1        " +
+                        ") " +
+                        "SELECT " +
+                        "    sum(a.value + b.value) " +
+                        "FROM union_of_aggregations a, union_of_aggregations b  " +
+                        "WHERE a.partkey = b.partkey ",
+                "SELECT 12404708",
+                assertRemoteExchangesCount(6)
+                        .andThen(assertRemoteMaterializedExchangesCount(4)));
+
+        // incompatible union partitioning, requires an extra remote exchange for build and probe
+        String incompatiblePartitioningQuery = "WITH union_of_aggregations as ( " +
+                "    SELECT " +
+                "        partkey, " +
+                "        count(*) as value " +
+                "    FROM lineitem " +
+                "    GROUP BY  " +
+                "        1 " +
+                "    UNION ALL " +
+                "    SELECT " +
+                "        partkey, " +
+                "        suppkey as value " +
+                "    FROM lineitem " +
+                "    GROUP BY  " +
+                "        1, 2        " +
+                ") " +
+                "SELECT " +
+                "    sum(a.value + b.value) " +
+                "FROM union_of_aggregations a, union_of_aggregations b  " +
+                "WHERE a.partkey = b.partkey ";
+
+        // system partitioning handle is always compatible
+        assertQuery(
+                broadcastJoinStreamingExchangesSession,
+                incompatiblePartitioningQuery,
+                "SELECT 4639006",
+                assertRemoteExchangesCount(6));
+
+        // hive partitioning handle is incompatible
+        assertQuery(
+                broadcastJoinMaterializeExchangesSession,
+                incompatiblePartitioningQuery,
+                "SELECT 4639006",
+                assertRemoteExchangesCount(8)
+                        .andThen(assertRemoteMaterializedExchangesCount(4)));
     }
 
     public static Consumer<Plan> assertRemoteMaterializedExchangesCount(int expectedRemoteExchangesCount)
@@ -3347,6 +3669,9 @@ public class TestHiveIntegrationSmokeTest
 
             assertQuery(notColocated, tableScan, expectedTableScan);
             assertQuery(eligibleTableScans, tableScan, expectedTableScan);
+
+            // Input connector returns non-empty TablePartitioning for unpartitioned table.
+            assertQuery(eligibleTableScans, "SELECT orderkey FROM tpch.tiny.orders", "SELECT orderkey FROM orders");
         }
         finally {
             assertUpdate(session, "DROP TABLE IF EXISTS test_grouped_join1");
@@ -3361,6 +3686,11 @@ public class TestHiveIntegrationSmokeTest
 
     private Consumer<Plan> assertRemoteExchangesCount(int expectedRemoteExchangesCount)
     {
+        return assertRemoteExchangesCount(expectedRemoteExchangesCount, getSession(), (DistributedQueryRunner) getQueryRunner());
+    }
+
+    public static Consumer<Plan> assertRemoteExchangesCount(int expectedRemoteExchangesCount, Session session, DistributedQueryRunner queryRunner)
+    {
         return plan ->
         {
             int actualRemoteExchangesCount = searchFrom(plan.getRoot())
@@ -3368,8 +3698,7 @@ public class TestHiveIntegrationSmokeTest
                     .findAll()
                     .size();
             if (actualRemoteExchangesCount != expectedRemoteExchangesCount) {
-                Session session = getSession();
-                Metadata metadata = ((DistributedQueryRunner) getQueryRunner()).getCoordinator().getMetadata();
+                Metadata metadata = queryRunner.getCoordinator().getMetadata();
                 String formattedPlan = textLogicalPlan(plan.getRoot(), plan.getTypes(), metadata.getFunctionManager(), StatsAndCosts.empty(), session, 0);
                 throw new AssertionError(format(
                         "Expected [\n%s\n] remote exchanges but found [\n%s\n] remote exchanges. Actual plan is [\n\n%s\n]",
@@ -3462,18 +3791,18 @@ public class TestHiveIntegrationSmokeTest
                 "   partitioned_by = ARRAY['p_varchar'] " +
                 ") " +
                 "AS " +
-                "SELECT c_boolean, c_bigint, c_double, c_timestamp, c_varchar, c_varbinary, p_varchar " +
+                "SELECT c_boolean, c_bigint, c_double, c_timestamp, c_varchar, c_varbinary, c_array, p_varchar " +
                 "FROM ( " +
                 "  VALUES " +
-                "    (null, null, null, null, null, null, 'p1'), " +
-                "    (null, null, null, null, null, null, 'p1'), " +
-                "    (true, BIGINT '1', DOUBLE '2.2', TIMESTAMP '2012-08-08 01:00', CAST('abc1' AS VARCHAR), CAST('bcd1' AS VARBINARY), 'p1')," +
-                "    (false, BIGINT '0', DOUBLE '1.2', TIMESTAMP '2012-08-08 00:00', CAST('abc2' AS VARCHAR), CAST('bcd2' AS VARBINARY), 'p1')," +
-                "    (null, null, null, null, null, null, 'p2'), " +
-                "    (null, null, null, null, null, null, 'p2'), " +
-                "    (true, BIGINT '2', DOUBLE '3.3', TIMESTAMP '2012-09-09 01:00', CAST('cba1' AS VARCHAR), CAST('dcb1' AS VARBINARY), 'p2'), " +
-                "    (false, BIGINT '1', DOUBLE '2.3', TIMESTAMP '2012-09-09 00:00', CAST('cba2' AS VARCHAR), CAST('dcb2' AS VARBINARY), 'p2') " +
-                ") AS x (c_boolean, c_bigint, c_double, c_timestamp, c_varchar, c_varbinary, p_varchar)", tableName), 8);
+                "    (null, null, null, null, null, null, null, 'p1'), " +
+                "    (null, null, null, null, null, null, null, 'p1'), " +
+                "    (true, BIGINT '1', DOUBLE '2.2', TIMESTAMP '2012-08-08 01:00', CAST('abc1' AS VARCHAR), CAST('bcd1' AS VARBINARY), sequence(0, 10), 'p1')," +
+                "    (false, BIGINT '0', DOUBLE '1.2', TIMESTAMP '2012-08-08 00:00', CAST('abc2' AS VARCHAR), CAST('bcd2' AS VARBINARY), sequence(10, 20), 'p1')," +
+                "    (null, null, null, null, null, null, null, 'p2'), " +
+                "    (null, null, null, null, null, null, null, 'p2'), " +
+                "    (true, BIGINT '2', DOUBLE '3.3', TIMESTAMP '2012-09-09 01:00', CAST('cba1' AS VARCHAR), CAST('dcb1' AS VARBINARY), sequence(20, 25), 'p2'), " +
+                "    (false, BIGINT '1', DOUBLE '2.3', TIMESTAMP '2012-09-09 00:00', CAST('cba2' AS VARCHAR), CAST('dcb2' AS VARBINARY), sequence(30, 35), 'p2') " +
+                ") AS x (c_boolean, c_bigint, c_double, c_timestamp, c_varchar, c_varbinary, c_array, p_varchar)", tableName), 8);
 
         assertQuery(format("SHOW STATS FOR (SELECT * FROM %s WHERE p_varchar = 'p1')", tableName),
                 "SELECT * FROM VALUES " +
@@ -3483,6 +3812,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 2.0E0, 0.5E0, null, null, null), " +
                         "('c_varchar', 8.0E0, 2.0E0, 0.5E0, null, null, null), " +
                         "('c_varbinary', 8.0E0, null, 0.5E0, null, null, null), " +
+                        "('c_array', 176.0E0, null, 0.5, null, null, null), " +
                         "('p_varchar', 8.0E0, 1.0E0, 0.0E0, null, null, null), " +
                         "(null, null, null, null, 4.0E0, null, null)");
         assertQuery(format("SHOW STATS FOR (SELECT * FROM %s WHERE p_varchar = 'p2')", tableName),
@@ -3493,6 +3823,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 2.0E0, 0.5E0, null, null, null), " +
                         "('c_varchar', 8.0E0, 2.0E0, 0.5E0, null, null, null), " +
                         "('c_varbinary', 8.0E0, null, 0.5E0, null, null, null), " +
+                        "('c_array', 96.0E0, null, 0.5, null, null, null), " +
                         "('p_varchar', 8.0E0, 1.0E0, 0.0E0, null, null, null), " +
                         "(null, null, null, null, 4.0E0, null, null)");
 
@@ -3505,6 +3836,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 0E0, 0E0, null, null, null), " +
                         "('c_varchar', 0E0, 0E0, 0E0, null, null, null), " +
                         "('c_varbinary', null, 0E0, 0E0, null, null, null), " +
+                        "('c_array', null, 0E0, 0E0, null, null, null), " +
                         "('p_varchar', 0E0, 0E0, 0E0, null, null, null), " +
                         "(null, null, null, null, 0E0, null, null)");
 
@@ -3523,6 +3855,7 @@ public class TestHiveIntegrationSmokeTest
                 "   c_timestamp TIMESTAMP, " +
                 "   c_varchar VARCHAR, " +
                 "   c_varbinary VARBINARY, " +
+                "   c_array ARRAY(BIGINT), " +
                 "   p_varchar VARCHAR " +
                 ") " +
                 "WITH ( " +
@@ -3531,18 +3864,18 @@ public class TestHiveIntegrationSmokeTest
 
         assertUpdate(format("" +
                 "INSERT INTO %s " +
-                "SELECT c_boolean, c_bigint, c_double, c_timestamp, c_varchar, c_varbinary, p_varchar " +
+                "SELECT c_boolean, c_bigint, c_double, c_timestamp, c_varchar, c_varbinary, c_array, p_varchar " +
                 "FROM ( " +
                 "  VALUES " +
-                "    (null, null, null, null, null, null, 'p1'), " +
-                "    (null, null, null, null, null, null, 'p1'), " +
-                "    (true, BIGINT '1', DOUBLE '2.2', TIMESTAMP '2012-08-08 01:00', CAST('abc1' AS VARCHAR), CAST('bcd1' AS VARBINARY), 'p1')," +
-                "    (false, BIGINT '0', DOUBLE '1.2', TIMESTAMP '2012-08-08 00:00', CAST('abc2' AS VARCHAR), CAST('bcd2' AS VARBINARY), 'p1')," +
-                "    (null, null, null, null, null, null, 'p2'), " +
-                "    (null, null, null, null, null, null, 'p2'), " +
-                "    (true, BIGINT '2', DOUBLE '3.3', TIMESTAMP '2012-09-09 01:00', CAST('cba1' AS VARCHAR), CAST('dcb1' AS VARBINARY), 'p2'), " +
-                "    (false, BIGINT '1', DOUBLE '2.3', TIMESTAMP '2012-09-09 00:00', CAST('cba2' AS VARCHAR), CAST('dcb2' AS VARBINARY), 'p2') " +
-                ") AS x (c_boolean, c_bigint, c_double, c_timestamp, c_varchar, c_varbinary, p_varchar)", tableName), 8);
+                "    (null, null, null, null, null, null, null, 'p1'), " +
+                "    (null, null, null, null, null, null, null, 'p1'), " +
+                "    (true, BIGINT '1', DOUBLE '2.2', TIMESTAMP '2012-08-08 01:00', CAST('abc1' AS VARCHAR), CAST('bcd1' AS VARBINARY), sequence(0, 10), 'p1')," +
+                "    (false, BIGINT '0', DOUBLE '1.2', TIMESTAMP '2012-08-08 00:00', CAST('abc2' AS VARCHAR), CAST('bcd2' AS VARBINARY), sequence(10, 20), 'p1')," +
+                "    (null, null, null, null, null, null, null, 'p2'), " +
+                "    (null, null, null, null, null, null, null, 'p2'), " +
+                "    (true, BIGINT '2', DOUBLE '3.3', TIMESTAMP '2012-09-09 01:00', CAST('cba1' AS VARCHAR), CAST('dcb1' AS VARBINARY), sequence(20, 25), 'p2'), " +
+                "    (false, BIGINT '1', DOUBLE '2.3', TIMESTAMP '2012-09-09 00:00', CAST('cba2' AS VARCHAR), CAST('dcb2' AS VARBINARY), sequence(30, 35), 'p2') " +
+                ") AS x (c_boolean, c_bigint, c_double, c_timestamp, c_varchar, c_varbinary, c_array, p_varchar)", tableName), 8);
 
         assertQuery(format("SHOW STATS FOR (SELECT * FROM %s WHERE p_varchar = 'p1')", tableName),
                 "SELECT * FROM VALUES " +
@@ -3552,6 +3885,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 2.0E0, 0.5E0, null, null, null), " +
                         "('c_varchar', 8.0E0, 2.0E0, 0.5E0, null, null, null), " +
                         "('c_varbinary', 8.0E0, null, 0.5E0, null, null, null), " +
+                        "('c_array', 176.0E0, null, 0.5E0, null, null, null), " +
                         "('p_varchar', 8.0E0, 1.0E0, 0.0E0, null, null, null), " +
                         "(null, null, null, null, 4.0E0, null, null)");
         assertQuery(format("SHOW STATS FOR (SELECT * FROM %s WHERE p_varchar = 'p2')", tableName),
@@ -3562,6 +3896,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 2.0E0, 0.5E0, null, null, null), " +
                         "('c_varchar', 8.0E0, 2.0E0, 0.5E0, null, null, null), " +
                         "('c_varbinary', 8.0E0, null, 0.5E0, null, null, null), " +
+                        "('c_array', 96.0E0, null, 0.5E0, null, null, null), " +
                         "('p_varchar', 8.0E0, 1.0E0, 0.0E0, null, null, null), " +
                         "(null, null, null, null, 4.0E0, null, null)");
 
@@ -3574,6 +3909,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 0E0, 0E0, null, null, null), " +
                         "('c_varchar', 0E0, 0E0, 0E0, null, null, null), " +
                         "('c_varbinary', null, 0E0, 0E0, null, null, null), " +
+                        "('c_array', null, 0E0, 0E0, null, null, null), " +
                         "('p_varchar', 0E0, 0E0, 0E0, null, null, null), " +
                         "(null, null, null, null, 0E0, null, null)");
 
@@ -3655,6 +3991,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, null, null, null, null, null), " +
                         "('c_varchar', null, null, null, null, null, null), " +
                         "('c_varbinary', null, null, null, null, null, null), " +
+                        "('c_array', null, null, null, null, null, null), " +
                         "('p_varchar', 24.0, 3.0, 0.25, null, null, null), " +
                         "('p_bigint', null, 2.0, 0.25, null, '7', '8'), " +
                         "(null, null, null, null, 16.0, null, null)");
@@ -3669,6 +4006,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, null, null, null, null, null), " +
                         "('c_varchar', null, null, null, null, null, null), " +
                         "('c_varbinary', null, null, null, null, null, null), " +
+                        "('c_array', null, null, null, null, null, null), " +
                         "('p_varchar', 24.0, 3.0, 0.25, null, null, null), " +
                         "('p_bigint', null, 2.0, 0.25, null, '7', '8'), " +
                         "(null, null, null, null, 16.0, null, null)");
@@ -3684,6 +4022,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 2.0, 0.5, null, null, null), " +
                         "('c_varchar', 8.0, 2.0, 0.5, null, null, null), " +
                         "('c_varbinary', 4.0, null, 0.5, null, null, null), " +
+                        "('c_array', 176.0, null, 0.5, null, null, null), " +
                         "('p_varchar', 8.0, 1.0, 0.0, null, null, null), " +
                         "('p_bigint', null, 1.0, 0.0, null, '7', '7'), " +
                         "(null, null, null, null, 4.0, null, null)");
@@ -3695,6 +4034,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 2.0, 0.5, null, null, null), " +
                         "('c_varchar', 8.0, 2.0, 0.5, null, null, null), " +
                         "('c_varbinary', 4.0, null, 0.5, null, null, null), " +
+                        "('c_array', 96.0, null, 0.5, null, null, null), " +
                         "('p_varchar', 8.0, 1.0, 0.0, null, null, null), " +
                         "('p_bigint', null, 1.0, 0.0, null, '7', '7'), " +
                         "(null, null, null, null, 4.0, null, null)");
@@ -3706,6 +4046,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 4.0, 0.0, null, null, null), " +
                         "('c_varchar', 16.0, 4.0, 0.0, null, null, null), " +
                         "('c_varbinary', 8.0, null, 0.0, null, null, null), " +
+                        "('c_array', 192.0, null, 0.0, null, null, null), " +
                         "('p_varchar', 0.0, 0.0, 1.0, null, null, null), " +
                         "('p_bigint', null, 0.0, 1.0, null, null, null), " +
                         "(null, null, null, null, 4.0, null, null)");
@@ -3719,6 +4060,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, null, null, null, null, null), " +
                         "('c_varchar', null, null, null, null, null, null), " +
                         "('c_varbinary', null, null, null, null, null, null), " +
+                        "('c_array', null, null, null, null, null, null), " +
                         "('p_varchar', 8.0, 1.0, 0.0, null, null, null), " +
                         "('p_bigint', null, 1.0, 0.0, null, '8', '8'), " +
                         "(null, null, null, null, 4.0, null, null)");
@@ -3730,6 +4072,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, null, null, null, null, null), " +
                         "('c_varchar', null, null, null, null, null, null), " +
                         "('c_varbinary', null, null, null, null, null, null), " +
+                        "('c_array', null, null, null, null, null, null), " +
                         "('p_varchar', 0.0, 0.0, 0.0, null, null, null), " +
                         "('p_bigint', null, 0.0, 0.0, null, null, null), " +
                         "(null, null, null, null, 0.0, null, null)");
@@ -3741,6 +4084,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, null, null, null, null, null), " +
                         "('c_varchar', null, null, null, null, null, null), " +
                         "('c_varbinary', null, null, null, null, null, null), " +
+                        "('c_array', null, null, null, null, null, null), " +
                         "('p_varchar', 0.0, 0.0, 0.0, null, null, null), " +
                         "('p_bigint', null, 0.0, 0.0, null, null, null), " +
                         "(null, null, null, null, 0.0, null, null)");
@@ -3757,6 +4101,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 2.0, 0.5, null, null, null), " +
                         "('c_varchar', 8.0, 2.0, 0.5, null, null, null), " +
                         "('c_varbinary', 4.0, null, 0.5, null, null, null), " +
+                        "('c_array', 176.0, null, 0.5, null, null, null), " +
                         "('p_varchar', 8.0, 1.0, 0.0, null, null, null), " +
                         "('p_bigint', null, 1.0, 0.0, null, '7', '7'), " +
                         "(null, null, null, null, 4.0, null, null)");
@@ -3768,6 +4113,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 2.0, 0.5, null, null, null), " +
                         "('c_varchar', 8.0, 2.0, 0.5, null, null, null), " +
                         "('c_varbinary', 4.0, null, 0.5, null, null, null), " +
+                        "('c_array', 96.0, null, 0.5, null, null, null), " +
                         "('p_varchar', 8.0, 1.0, 0.0, null, null, null), " +
                         "('p_bigint', null, 1.0, 0.0, null, '7', '7'), " +
                         "(null, null, null, null, 4.0, null, null)");
@@ -3779,6 +4125,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 4.0, 0.0, null, null, null), " +
                         "('c_varchar', 16.0, 4.0, 0.0, null, null, null), " +
                         "('c_varbinary', 8.0, null, 0.0, null, null, null), " +
+                        "('c_array', 192.0, null, 0.0, null, null, null), " +
                         "('p_varchar', 0.0, 0.0, 1.0, null, null, null), " +
                         "('p_bigint', null, 0.0, 1.0, null, null, null), " +
                         "(null, null, null, null, 4.0, null, null)");
@@ -3790,6 +4137,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 2.0, 0.5, null, null, null), " +
                         "('c_varchar', 8.0, 2.0, 0.5, null, null, null), " +
                         "('c_varbinary', 4.0, null, 0.5, null, null, null), " +
+                        "('c_array', 96.0, null, 0.5, null, null, null), " +
                         "('p_varchar', 8.0, 1.0, 0.0, null, null, null), " +
                         "('p_bigint', null, 1.0, 0.0, null, '8', '8'), " +
                         "(null, null, null, null, 4.0, null, null)");
@@ -3801,6 +4149,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 0.0, 0.0, null, null, null), " +
                         "('c_varchar', 0.0, 0.0, 0.0, null, null, null), " +
                         "('c_varbinary', 0.0, null, 0.0, null, null, null), " +
+                        "('c_array', 0.0, null, 0.0, null, null, null), " +
                         "('p_varchar', 0.0, 0.0, 0.0, null, null, null), " +
                         "('p_bigint', null, 0.0, 0.0, null, null, null), " +
                         "(null, null, null, null, 0.0, null, null)");
@@ -3812,6 +4161,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 0.0, 0.0, null, null, null), " +
                         "('c_varchar', 0.0, 0.0, 0.0, null, null, null), " +
                         "('c_varbinary', 0.0, null, 0.0, null, null, null), " +
+                        "('c_array', 0.0, null, 0.0, null, null, null), " +
                         "('p_varchar', 0.0, 0.0, 0.0, null, null, null), " +
                         "('p_bigint', null, 0.0, 0.0, null, null, null), " +
                         "(null, null, null, null, 0.0, null, null)");
@@ -3835,6 +4185,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, null, null, null, null, null), " +
                         "('c_varchar', null, null, null, null, null, null), " +
                         "('c_varbinary', null, null, null, null, null, null), " +
+                        "('c_array', null, null, null, null, null, null), " +
                         "('p_varchar', null, null, null, null, null, null), " +
                         "('p_bigint', null, null, null, null, null, null), " +
                         "(null, null, null, null, 16.0, null, null)");
@@ -3850,6 +4201,7 @@ public class TestHiveIntegrationSmokeTest
                         "('c_timestamp', null, 10.0, 0.375, null, null, null), " +
                         "('c_varchar', 40.0, 10.0, 0.375, null, null, null), " +
                         "('c_varbinary', 20.0, null, 0.375, null, null, null), " +
+                        "('c_array', 560.0, null, 0.375, null, null, null), " +
                         "('p_varchar', 24.0, 3.0, 0.25, null, null, null), " +
                         "('p_bigint', null, 2.0, 0.25, null, '7', '8'), " +
                         "(null, null, null, null, 16.0, null, null)");
@@ -3884,30 +4236,30 @@ public class TestHiveIntegrationSmokeTest
                         tableName +
                         (partitioned ? " WITH (partitioned_by = ARRAY['p_varchar', 'p_bigint'])\n" : " ") +
                         "AS " +
-                        "SELECT c_boolean, c_bigint, c_double, c_timestamp, c_varchar, c_varbinary, p_varchar, p_bigint " +
+                        "SELECT c_boolean, c_bigint, c_double, c_timestamp, c_varchar, c_varbinary, c_array, p_varchar, p_bigint " +
                         "FROM ( " +
                         "  VALUES " +
                         // p_varchar = 'p1', p_bigint = BIGINT '7'
-                        "    (null, null, null, null, null, null, 'p1', BIGINT '7'), " +
-                        "    (null, null, null, null, null, null, 'p1', BIGINT '7'), " +
-                        "    (true, BIGINT '1', DOUBLE '2.2', TIMESTAMP '2012-08-08 01:00', 'abc1', X'bcd1', 'p1', BIGINT '7'), " +
-                        "    (false, BIGINT '0', DOUBLE '1.2', TIMESTAMP '2012-08-08 00:00', 'abc2', X'bcd2', 'p1', BIGINT '7'), " +
+                        "    (null, null, null, null, null, null, null, 'p1', BIGINT '7'), " +
+                        "    (null, null, null, null, null, null, null, 'p1', BIGINT '7'), " +
+                        "    (true, BIGINT '1', DOUBLE '2.2', TIMESTAMP '2012-08-08 01:00', 'abc1', X'bcd1', sequence(0, 10), 'p1', BIGINT '7'), " +
+                        "    (false, BIGINT '0', DOUBLE '1.2', TIMESTAMP '2012-08-08 00:00', 'abc2', X'bcd2', sequence(10, 20), 'p1', BIGINT '7'), " +
                         // p_varchar = 'p2', p_bigint = BIGINT '7'
-                        "    (null, null, null, null, null, null, 'p2', BIGINT '7'), " +
-                        "    (null, null, null, null, null, null, 'p2', BIGINT '7'), " +
-                        "    (true, BIGINT '2', DOUBLE '3.3', TIMESTAMP '2012-09-09 01:00', 'cba1', X'dcb1', 'p2', BIGINT '7'), " +
-                        "    (false, BIGINT '1', DOUBLE '2.3', TIMESTAMP '2012-09-09 00:00', 'cba2', X'dcb2', 'p2', BIGINT '7'), " +
+                        "    (null, null, null, null, null, null, null, 'p2', BIGINT '7'), " +
+                        "    (null, null, null, null, null, null, null, 'p2', BIGINT '7'), " +
+                        "    (true, BIGINT '2', DOUBLE '3.3', TIMESTAMP '2012-09-09 01:00', 'cba1', X'dcb1', sequence(20, 25), 'p2', BIGINT '7'), " +
+                        "    (false, BIGINT '1', DOUBLE '2.3', TIMESTAMP '2012-09-09 00:00', 'cba2', X'dcb2', sequence(30, 35), 'p2', BIGINT '7'), " +
                         // p_varchar = 'p3', p_bigint = BIGINT '8'
-                        "    (null, null, null, null, null, null, 'p3', BIGINT '8'), " +
-                        "    (null, null, null, null, null, null, 'p3', BIGINT '8'), " +
-                        "    (true, BIGINT '3', DOUBLE '4.4', TIMESTAMP '2012-10-10 01:00', 'bca1', X'cdb1', 'p3', BIGINT '8'), " +
-                        "    (false, BIGINT '2', DOUBLE '3.4', TIMESTAMP '2012-10-10 00:00', 'bca2', X'cdb2', 'p3', BIGINT '8'), " +
+                        "    (null, null, null, null, null, null, null, 'p3', BIGINT '8'), " +
+                        "    (null, null, null, null, null, null, null, 'p3', BIGINT '8'), " +
+                        "    (true, BIGINT '3', DOUBLE '4.4', TIMESTAMP '2012-10-10 01:00', 'bca1', X'cdb1', sequence(40, 45), 'p3', BIGINT '8'), " +
+                        "    (false, BIGINT '2', DOUBLE '3.4', TIMESTAMP '2012-10-10 00:00', 'bca2', X'cdb2', sequence(50, 55), 'p3', BIGINT '8'), " +
                         // p_varchar = NULL, p_bigint = NULL
-                        "    (false, BIGINT '7', DOUBLE '7.7', TIMESTAMP '1977-07-07 07:07', 'efa1', X'efa1', NULL, NULL), " +
-                        "    (false, BIGINT '6', DOUBLE '6.7', TIMESTAMP '1977-07-07 07:06', 'efa2', X'efa2', NULL, NULL), " +
-                        "    (false, BIGINT '5', DOUBLE '5.7', TIMESTAMP '1977-07-07 07:05', 'efa3', X'efa3', NULL, NULL), " +
-                        "    (false, BIGINT '4', DOUBLE '4.7', TIMESTAMP '1977-07-07 07:04', 'efa4', X'efa4', NULL, NULL) " +
-                        ") AS x (c_boolean, c_bigint, c_double, c_timestamp, c_varchar, c_varbinary, p_varchar, p_bigint)", 16);
+                        "    (false, BIGINT '7', DOUBLE '7.7', TIMESTAMP '1977-07-07 07:07', 'efa1', X'efa1', sequence(60, 65), NULL, NULL), " +
+                        "    (false, BIGINT '6', DOUBLE '6.7', TIMESTAMP '1977-07-07 07:06', 'efa2', X'efa2', sequence(70, 75), NULL, NULL), " +
+                        "    (false, BIGINT '5', DOUBLE '5.7', TIMESTAMP '1977-07-07 07:05', 'efa3', X'efa3', sequence(80, 85), NULL, NULL), " +
+                        "    (false, BIGINT '4', DOUBLE '4.7', TIMESTAMP '1977-07-07 07:04', 'efa4', X'efa4', sequence(90, 95), NULL, NULL) " +
+                        ") AS x (c_boolean, c_bigint, c_double, c_timestamp, c_varchar, c_varbinary, c_array, p_varchar, p_bigint)", 16);
 
         if (partitioned) {
             // Create empty partitions
@@ -4081,6 +4433,16 @@ public class TestHiveIntegrationSmokeTest
     }
 
     @Test
+    public void testBucketedTablesFailWithTooManyBuckets()
+            throws Exception
+    {
+        @Language("SQL") String createSql = "CREATE TABLE t (dummy VARCHAR)\n" +
+                "WITH (bucket_count = 1000001, bucketed_by=ARRAY['dummy'])";
+
+        assertQueryFails(createSql, "bucket_count should be no more than 1000000");
+    }
+
+    @Test
     public void testBucketedTablesFailWithAvroSchemaUrl()
             throws Exception
     {
@@ -4147,7 +4509,7 @@ public class TestHiveIntegrationSmokeTest
         Session pushdownFilterEnabled = Session.builder(getQueryRunner().getDefaultSession())
                 .setCatalogSessionProperty(catalog, PUSHDOWN_FILTER_ENABLED, "true")
                 .build();
-        assertQueryFails(pushdownFilterEnabled, "SELECT comment FROM lineitem WHERE comment LIKE 'abc%'", "Complex predicate pushdown is not supported yet");
+        assertQuerySucceeds(pushdownFilterEnabled, "SELECT comment FROM lineitem WHERE comment LIKE 'abc%'");
     }
 
     @Test
@@ -4175,6 +4537,47 @@ public class TestHiveIntegrationSmokeTest
                 .setCatalogSessionProperty(bucketedSession.getCatalog().get(), "ignore_table_bucketing", "true")
                 .build();
         assertQueryFails(ignoreBucketingSession, query, "Table bucketing is ignored\\. The virtual \"\\$bucket\" column cannot be referenced\\.");
+    }
+
+    @Test
+    public void testTableWriterMergeNodeIsPresent()
+    {
+        assertUpdate(
+                getSession(),
+                "CREATE TABLE test_table_writer_merge_operator AS SELECT orderkey FROM orders",
+                15000,
+                assertTableWriterMergeNodeIsPresent());
+    }
+
+    @Test
+    public void testPropertiesTable()
+    {
+        @Language("SQL") String createTable = "" +
+                "CREATE TABLE test_show_properties" +
+                " WITH (" +
+                "format = 'orc', " +
+                "partitioned_by = ARRAY['ship_priority', 'order_status']," +
+                "orc_bloom_filter_columns = ARRAY['ship_priority', 'order_status']," +
+                "orc_bloom_filter_fpp = 0.5" +
+                ") " +
+                "AS " +
+                "SELECT orderkey AS order_key, shippriority AS ship_priority, orderstatus AS order_status " +
+                "FROM tpch.tiny.orders";
+
+        assertUpdate(createTable, "SELECT count(*) FROM orders");
+        String queryId = (String) computeScalar("SELECT query_id FROM system.runtime.queries WHERE query LIKE 'CREATE TABLE test_show_properties%'");
+        String nodeVersion = (String) computeScalar("SELECT node_version FROM system.runtime.nodes WHERE coordinator");
+        assertQuery("SELECT * FROM \"test_show_properties$properties\"",
+                "SELECT '" + "ship_priority,order_status" + "','" + "0.5" + "','" + queryId + "','" + nodeVersion + "'");
+        assertUpdate("DROP TABLE test_show_properties");
+    }
+
+    private static Consumer<Plan> assertTableWriterMergeNodeIsPresent()
+    {
+        return plan -> assertTrue(searchFrom(plan.getRoot())
+                .where(node -> node instanceof TableWriterMergeNode)
+                .findFirst()
+                .isPresent());
     }
 
     private HiveInsertTableHandle getHiveInsertTableHandle(Session session, String tableName)

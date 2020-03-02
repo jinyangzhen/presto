@@ -15,6 +15,7 @@
 package com.facebook.presto.spi.block;
 
 import com.facebook.presto.spi.type.Type;
+import io.airlift.slice.SliceOutput;
 import org.openjdk.jol.info.ClassLayout;
 
 import javax.annotation.Nullable;
@@ -144,7 +145,7 @@ public abstract class AbstractMapBlock
                 newOffsets,
                 newKeys,
                 newValues,
-                new HashTables(Optional.ofNullable(newRawHashTables), newHashTableEntries),
+                new HashTables(Optional.ofNullable(newRawHashTables), length, newHashTableEntries),
                 keyType,
                 keyBlockNativeEquals,
                 keyNativeHashCode,
@@ -218,6 +219,7 @@ public abstract class AbstractMapBlock
                 Integer.BYTES * HASH_MULTIPLIER * (long) usedEntryCount +
                 getHashTables().getInstanceSizeInBytes();
     }
+
     @Override
     public Block copyRegion(int position, int length)
     {
@@ -250,7 +252,7 @@ public abstract class AbstractMapBlock
                 newOffsets,
                 newKeys,
                 newValues,
-                new HashTables(Optional.ofNullable(newRawHashTables), expectedNewHashTableEntries),
+                new HashTables(Optional.ofNullable(newRawHashTables), length, expectedNewHashTableEntries),
                 keyType,
                 keyBlockNativeEquals,
                 keyNativeHashCode,
@@ -258,19 +260,16 @@ public abstract class AbstractMapBlock
     }
 
     @Override
-    public <T> T getObject(int position, Class<T> clazz)
+    public Block getBlock(int position)
     {
-        if (clazz != Block.class) {
-            throw new IllegalArgumentException("clazz must be Block.class");
-        }
         checkReadablePosition(position);
 
         int startEntryOffset = getOffset(position);
         int endEntryOffset = getOffset(position + 1);
-        return clazz.cast(new SingleMapBlock(
+        return new SingleMapBlock(
                 startEntryOffset * 2,
                 (endEntryOffset - startEntryOffset) * 2,
-                this));
+                this);
     }
 
     @Override
@@ -278,6 +277,28 @@ public abstract class AbstractMapBlock
     {
         checkReadablePosition(position);
         blockBuilder.appendStructureInternal(this, position);
+    }
+
+    @Override
+    public void writePositionTo(int position, SliceOutput output)
+    {
+        if (isNull(position)) {
+            output.writeByte(0);
+        }
+        else {
+            int startValueOffset = getOffset(position);
+            int endValueOffset = getOffset(position + 1);
+            int numberOfElements = endValueOffset - startValueOffset;
+
+            output.writeByte(1);
+            output.writeInt(numberOfElements);
+            Block rawKeyBlock = getRawKeyBlock();
+            Block rawValueBlock = getRawValueBlock();
+            for (int i = startValueOffset; i < endValueOffset; i++) {
+                rawKeyBlock.writePositionTo(i, output);
+                rawValueBlock.writePositionTo(i, output);
+            }
+        }
     }
 
     @Override
@@ -305,7 +326,7 @@ public abstract class AbstractMapBlock
                 new int[] {0, valueLength},
                 newKeys,
                 newValues,
-                new HashTables(Optional.ofNullable(newRawHashTables), expectedNewHashTableEntries),
+                new HashTables(Optional.ofNullable(newRawHashTables), 1, expectedNewHashTableEntries),
                 keyType,
                 keyBlockNativeEquals,
                 keyNativeHashCode,
@@ -370,10 +391,13 @@ public abstract class AbstractMapBlock
         @Nullable
         private volatile int[] hashTables;
 
-        // The number of entries of hashTables array as if they are always built. It's used to calculate the retained size.
+        // The number of hash tables. Each map row corresponds to one hash table if it's built.
+        private int expectedHashTableCount;
+
+        // The total number of entries of all hashTables as if they are always built. It's used to calculate the retained size.
         private int expectedEntryCount;
 
-        HashTables(Optional<int[]> hashTables, int expectedEntryCount)
+        HashTables(Optional<int[]> hashTables, int expectedHashTableCount, int expectedEntryCount)
         {
             if (hashTables.isPresent() && hashTables.get().length != expectedEntryCount) {
                 throw new IllegalArgumentException("hashTables size does not match expectedEntryCount");
@@ -381,6 +405,7 @@ public abstract class AbstractMapBlock
 
             this.hashTables = hashTables.orElse(null);
             this.expectedEntryCount = expectedEntryCount;
+            this.expectedHashTableCount = expectedHashTableCount;
         }
 
         Optional<int[]> get()
@@ -395,6 +420,11 @@ public abstract class AbstractMapBlock
 
             // The passed in hashTables are always sized as if they are fully built.
             this.expectedEntryCount = hashTables.length;
+        }
+
+        int getExpectedHashTableCount()
+        {
+            return expectedHashTableCount;
         }
 
         public long getInstanceSizeInBytes()

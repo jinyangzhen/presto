@@ -17,6 +17,7 @@ import com.facebook.presto.Session;
 import com.facebook.presto.execution.warnings.WarningCollector;
 import com.facebook.presto.metadata.FunctionManager;
 import com.facebook.presto.metadata.Metadata;
+import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.function.FunctionMetadata;
 import com.facebook.presto.spi.function.OperatorType;
 import com.facebook.presto.spi.relation.CallExpression;
@@ -33,9 +34,8 @@ import com.facebook.presto.sql.analyzer.Scope;
 import com.facebook.presto.sql.planner.ExpressionInterpreter;
 import com.facebook.presto.sql.planner.LiteralEncoder;
 import com.facebook.presto.sql.planner.LiteralInterpreter;
-import com.facebook.presto.sql.planner.NoOpSymbolResolver;
+import com.facebook.presto.sql.planner.NoOpVariableResolver;
 import com.facebook.presto.sql.planner.RowExpressionInterpreter;
-import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.planner.TypeProvider;
 import com.facebook.presto.sql.relational.FunctionResolution;
 import com.facebook.presto.sql.tree.AstVisitor;
@@ -57,6 +57,7 @@ import com.google.common.base.VerifyException;
 import com.google.common.collect.ImmutableList;
 
 import javax.annotation.Nullable;
+import javax.inject.Inject;
 
 import java.util.List;
 import java.util.Map;
@@ -69,7 +70,8 @@ import static com.facebook.presto.cost.PlanNodeStatsEstimateMath.addStatsAndSumD
 import static com.facebook.presto.cost.PlanNodeStatsEstimateMath.capStats;
 import static com.facebook.presto.cost.PlanNodeStatsEstimateMath.subtractSubsetStats;
 import static com.facebook.presto.cost.StatsUtil.toStatsRepresentation;
-import static com.facebook.presto.spi.relation.LogicalRowExpressions.and;
+import static com.facebook.presto.expressions.LogicalRowExpressions.and;
+import static com.facebook.presto.spi.relation.ExpressionOptimizer.Level.OPTIMIZED;
 import static com.facebook.presto.spi.relation.SpecialFormExpression.Form.IS_NULL;
 import static com.facebook.presto.spi.type.BooleanType.BOOLEAN;
 import static com.facebook.presto.sql.ExpressionUtils.and;
@@ -104,6 +106,7 @@ public class FilterStatsCalculator
     private final LiteralEncoder literalEncoder;
     private final FunctionResolution functionResolution;
 
+    @Inject
     public FilterStatsCalculator(Metadata metadata, ScalarStatsCalculator scalarStatsCalculator, StatsNormalizer normalizer)
     {
         this.metadata = requireNonNull(metadata, "metadata is null");
@@ -125,15 +128,21 @@ public class FilterStatsCalculator
                 .process(simplifiedExpression);
     }
 
-    // TODO: remove types once we have type info in PlanNodeStatsEstimate
     public PlanNodeStatsEstimate filterStats(
             PlanNodeStatsEstimate statsEstimate,
             RowExpression predicate,
-            Session session,
-            TypeProvider types)
+            ConnectorSession session)
     {
         RowExpression simplifiedExpression = simplifyExpression(session, predicate);
-        return new FilterRowExpressionStatsCalculatingVisitor(statsEstimate, session, metadata.getFunctionManager(), types).process(simplifiedExpression);
+        return new FilterRowExpressionStatsCalculatingVisitor(statsEstimate, session, metadata.getFunctionManager()).process(simplifiedExpression);
+    }
+
+    public PlanNodeStatsEstimate filterStats(
+            PlanNodeStatsEstimate statsEstimate,
+            RowExpression predicate,
+            Session session)
+    {
+        return filterStats(statsEstimate, predicate, session.toConnectorSession());
     }
 
     private Expression simplifyExpression(Session session, Expression predicate, TypeProvider types)
@@ -142,7 +151,7 @@ public class FilterStatsCalculator
 
         Map<NodeRef<Expression>, Type> expressionTypes = getExpressionTypes(session, predicate, types);
         ExpressionInterpreter interpreter = ExpressionInterpreter.expressionOptimizer(predicate, metadata, session, expressionTypes);
-        Object value = interpreter.optimize(NoOpSymbolResolver.INSTANCE);
+        Object value = interpreter.optimize(NoOpVariableResolver.INSTANCE);
 
         if (value == null) {
             // Expression evaluates to SQL null, which in Filter is equivalent to false. This assumes the expression is a top-level expression (eg. not in NOT).
@@ -151,9 +160,9 @@ public class FilterStatsCalculator
         return literalEncoder.toExpression(value, BOOLEAN);
     }
 
-    private RowExpression simplifyExpression(Session session, RowExpression predicate)
+    private RowExpression simplifyExpression(ConnectorSession session, RowExpression predicate)
     {
-        RowExpressionInterpreter interpreter = new RowExpressionInterpreter(predicate, metadata, session.toConnectorSession(), true);
+        RowExpressionInterpreter interpreter = new RowExpressionInterpreter(predicate, metadata, session, OPTIMIZED);
         Object value = interpreter.optimize();
 
         if (value == null) {
@@ -297,7 +306,7 @@ public class FilterStatsCalculator
         protected PlanNodeStatsEstimate visitIsNotNullPredicate(IsNotNullPredicate node, Void context)
         {
             if (node.getValue() instanceof SymbolReference) {
-                VariableReferenceExpression variable = toVariable(Symbol.from(node.getValue()));
+                VariableReferenceExpression variable = toVariable(node.getValue());
                 VariableStatsEstimate variableStats = input.getVariableStatistics(variable);
                 PlanNodeStatsEstimate.Builder result = PlanNodeStatsEstimate.buildFrom(input);
                 result.setOutputRowCount(input.getOutputRowCount() * (1 - variableStats.getNullsFraction()));
@@ -311,7 +320,7 @@ public class FilterStatsCalculator
         protected PlanNodeStatsEstimate visitIsNullPredicate(IsNullPredicate node, Void context)
         {
             if (node.getValue() instanceof SymbolReference) {
-                VariableReferenceExpression variable = toVariable(Symbol.from(node.getValue()));
+                VariableReferenceExpression variable = toVariable(node.getValue());
                 VariableStatsEstimate variableStats = input.getVariableStatistics(variable);
                 PlanNodeStatsEstimate.Builder result = PlanNodeStatsEstimate.buildFrom(input);
                 result.setOutputRowCount(input.getOutputRowCount() * variableStats.getNullsFraction());
@@ -339,7 +348,7 @@ public class FilterStatsCalculator
                 return PlanNodeStatsEstimate.unknown();
             }
 
-            VariableStatsEstimate valueStats = input.getVariableStatistics(toVariable(Symbol.from(node.getValue())));
+            VariableStatsEstimate valueStats = input.getVariableStatistics(toVariable(node.getValue()));
             Expression lowerBound = new ComparisonExpression(GREATER_THAN_OR_EQUAL, node.getValue(), node.getMin());
             Expression upperBound = new ComparisonExpression(LESS_THAN_OR_EQUAL, node.getValue(), node.getMax());
 
@@ -390,7 +399,7 @@ public class FilterStatsCalculator
             result.setOutputRowCount(min(inEstimate.getOutputRowCount(), notNullValuesBeforeIn));
 
             if (node.getValue() instanceof SymbolReference) {
-                VariableReferenceExpression valueVariable = toVariable(Symbol.from(node.getValue()));
+                VariableReferenceExpression valueVariable = toVariable(node.getValue());
                 VariableStatsEstimate newvariableStats = inEstimate.getVariableStatistics(valueVariable)
                         .mapDistinctValuesCount(newDistinctValuesCount -> min(newDistinctValuesCount, valueStats.getDistinctValuesCount()));
                 result.addVariableStatistics(valueVariable, newvariableStats);
@@ -422,7 +431,7 @@ public class FilterStatsCalculator
             }
 
             VariableStatsEstimate leftStats = getExpressionStats(left);
-            Optional<VariableReferenceExpression> leftVariable = left instanceof SymbolReference ? Optional.of(toVariable(Symbol.from(left))) : Optional.empty();
+            Optional<VariableReferenceExpression> leftVariable = left instanceof SymbolReference ? Optional.of(toVariable(left)) : Optional.empty();
             if (right instanceof Literal) {
                 Object literalValue = LiteralInterpreter.evaluate(metadata, session.toConnectorSession(), right);
                 if (literalValue == null) {
@@ -438,15 +447,14 @@ public class FilterStatsCalculator
                 return estimateExpressionToLiteralComparison(input, leftStats, leftVariable, value, operator);
             }
 
-            Optional<VariableReferenceExpression> rightVariable = right instanceof SymbolReference ? Optional.of(toVariable(Symbol.from(right))) : Optional.empty();
+            Optional<VariableReferenceExpression> rightVariable = right instanceof SymbolReference ? Optional.of(toVariable(right)) : Optional.empty();
             return estimateExpressionToExpressionComparison(input, leftStats, leftVariable, rightStats, rightVariable, operator);
         }
 
         private Type getType(Expression expression)
         {
             if (expression instanceof SymbolReference) {
-                Symbol symbol = Symbol.from(expression);
-                return requireNonNull(types.get(symbol), () -> format("No type for symbol %s", symbol));
+                return requireNonNull(types.get(expression), () -> format("No type for expression %s", expression));
             }
 
             ExpressionAnalyzer expressionAnalyzer = ExpressionAnalyzer.createWithoutSubqueries(
@@ -465,15 +473,16 @@ public class FilterStatsCalculator
         private VariableStatsEstimate getExpressionStats(Expression expression)
         {
             if (expression instanceof SymbolReference) {
-                VariableReferenceExpression variable = toVariable(Symbol.from(expression));
+                VariableReferenceExpression variable = toVariable(expression);
                 return requireNonNull(input.getVariableStatistics(variable), () -> format("No statistics for variable %s", variable));
             }
             return scalarStatsCalculator.calculate(expression, input, session, types);
         }
 
-        private VariableReferenceExpression toVariable(Symbol symbol)
+        private VariableReferenceExpression toVariable(Expression expression)
         {
-            return new VariableReferenceExpression(symbol.getName(), types.get(symbol));
+            checkArgument(expression instanceof SymbolReference, "Unexpected expression: %s", expression);
+            return new VariableReferenceExpression(((SymbolReference) expression).getName(), types.get(expression));
         }
     }
 
@@ -481,16 +490,14 @@ public class FilterStatsCalculator
             implements RowExpressionVisitor<PlanNodeStatsEstimate, Void>
     {
         private final PlanNodeStatsEstimate input;
-        private final Session session;
+        private final ConnectorSession session;
         private final FunctionManager functionManager;
-        private final TypeProvider types;
 
-        FilterRowExpressionStatsCalculatingVisitor(PlanNodeStatsEstimate input, Session session, FunctionManager functionManager, TypeProvider types)
+        FilterRowExpressionStatsCalculatingVisitor(PlanNodeStatsEstimate input, ConnectorSession session, FunctionManager functionManager)
         {
             this.input = requireNonNull(input, "input is null");
             this.session = requireNonNull(session, "session is null");
             this.functionManager = requireNonNull(functionManager, "functionManager is null");
-            this.types = requireNonNull(types, "types is null");
         }
 
         @Override
@@ -576,7 +583,7 @@ public class FilterStatsCalculator
                     if (rightValue == null) {
                         return visitConstant(constantNull(BOOLEAN), null);
                     }
-                    OptionalDouble literal = toStatsRepresentation(metadata, session, right.getType(), rightValue);
+                    OptionalDouble literal = toStatsRepresentation(metadata.getFunctionManager(), session, right.getType(), rightValue);
                     return estimateExpressionToLiteralComparison(input, leftStats, leftVariable, literal, getComparisonOperator(operatorType));
                 }
 
@@ -661,7 +668,7 @@ public class FilterStatsCalculator
 
         private FilterRowExpressionStatsCalculatingVisitor newEstimate(PlanNodeStatsEstimate input)
         {
-            return new FilterRowExpressionStatsCalculatingVisitor(input, session, functionManager, types);
+            return new FilterRowExpressionStatsCalculatingVisitor(input, session, functionManager);
         }
 
         private PlanNodeStatsEstimate process(RowExpression rowExpression)

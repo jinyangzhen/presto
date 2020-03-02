@@ -30,13 +30,13 @@ import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.PlanNodeIdAllocator;
 import com.facebook.presto.spi.plan.PlanVisitor;
 import com.facebook.presto.spi.plan.TableScanNode;
+import com.facebook.presto.spi.plan.UnionNode;
 import com.facebook.presto.spi.plan.ValuesNode;
 import com.facebook.presto.spi.predicate.TupleDomain;
 import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.sql.planner.Plan;
-import com.facebook.presto.sql.planner.Symbol;
-import com.facebook.presto.sql.planner.SymbolAllocator;
+import com.facebook.presto.sql.planner.PlanVariableAllocator;
 import com.facebook.presto.sql.planner.TypeProvider;
 import com.facebook.presto.sql.planner.assertions.MatchResult;
 import com.facebook.presto.sql.planner.assertions.Matcher;
@@ -45,7 +45,6 @@ import com.facebook.presto.sql.planner.assertions.PlanMatchPattern;
 import com.facebook.presto.sql.planner.assertions.SymbolAliases;
 import com.facebook.presto.sql.planner.iterative.rule.test.PlanBuilder;
 import com.facebook.presto.sql.planner.plan.OutputNode;
-import com.facebook.presto.sql.planner.plan.UnionNode;
 import com.facebook.presto.sql.tree.SymbolReference;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableListMultimap;
@@ -61,9 +60,9 @@ import java.util.Optional;
 import java.util.Set;
 
 import static com.facebook.presto.SessionTestUtils.TEST_SESSION;
-import static com.facebook.presto.spi.relation.LogicalRowExpressions.TRUE_CONSTANT;
-import static com.facebook.presto.spi.relation.LogicalRowExpressions.and;
-import static com.facebook.presto.spi.relation.LogicalRowExpressions.or;
+import static com.facebook.presto.expressions.LogicalRowExpressions.TRUE_CONSTANT;
+import static com.facebook.presto.expressions.LogicalRowExpressions.and;
+import static com.facebook.presto.expressions.LogicalRowExpressions.or;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.node;
 import static com.google.common.base.MoreObjects.toStringHelper;
@@ -78,7 +77,7 @@ import static org.testng.Assert.assertEquals;
 public class TestConnectorOptimization
 {
     private static final Metadata METADATA = MetadataManager.createTestMetadataManager();
-    private static final PlanBuilder PLAN_BUILDER = new PlanBuilder(new PlanNodeIdAllocator(), METADATA);
+    private static final PlanBuilder PLAN_BUILDER = new PlanBuilder(TEST_SESSION, new PlanNodeIdAllocator(), METADATA);
 
     @Test
     public void testSupportedPlanNodes()
@@ -203,7 +202,7 @@ public class TestConnectorOptimization
                         PlanMatchPattern.filter(
                                 "a AND b",
                                 SimpleTableScanMatcher.tableScan("cat1", "a", "b"))),
-                TypeProvider.copyOf(ImmutableMap.of(new Symbol("a"), BIGINT, new Symbol("b"), BIGINT)));
+                TypeProvider.viewOf(ImmutableMap.of("a", BIGINT, "b", BIGINT)));
 
         // (2) with filter node case
         RowExpression existingPredicate = or(newBigintVariable("a"), newBigintVariable("b"));
@@ -221,7 +220,7 @@ public class TestConnectorOptimization
                         PlanMatchPattern.filter(
                                 "(a OR b) AND (a AND b)",
                                 SimpleTableScanMatcher.tableScan("cat1", "a", "b"))),
-                TypeProvider.copyOf(ImmutableMap.of(new Symbol("a"), BIGINT, new Symbol("b"), BIGINT)));
+                TypeProvider.viewOf(ImmutableMap.of("a", BIGINT, "b", BIGINT)));
     }
 
     private TableScanNode tableScan(String connectorName, String... columnNames)
@@ -286,7 +285,7 @@ public class TestConnectorOptimization
     private static PlanNode optimize(PlanNode plan, Map<ConnectorId, Set<ConnectorPlanOptimizer>> optimizers)
     {
         ApplyConnectorOptimization optimizer = new ApplyConnectorOptimization(() -> optimizers);
-        return optimizer.optimize(plan, TEST_SESSION, TypeProvider.empty(), new SymbolAllocator(), new PlanNodeIdAllocator(), WarningCollector.NOOP);
+        return optimizer.optimize(plan, TEST_SESSION, TypeProvider.empty(), new PlanVariableAllocator(), new PlanNodeIdAllocator(), WarningCollector.NOOP);
     }
 
     private static ConnectorPlanOptimizer filterPushdown()

@@ -14,11 +14,14 @@
 package com.facebook.presto.hive;
 
 import com.facebook.presto.hive.HiveBucketing.HiveBucketFilter;
+import com.facebook.presto.hive.metastore.Column;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.predicate.TupleDomain;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 
-import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static java.util.Objects.requireNonNull;
@@ -34,7 +37,9 @@ import static java.util.Objects.requireNonNull;
 public class HivePartitionResult
 {
     private final List<HiveColumnHandle> partitionColumns;
-    private final Iterable<HivePartition> partitions;
+    private final List<Column> dataColumns;
+    private final Map<String, String> tableParameters;
+    private final List<HivePartition> partitions;
     private final TupleDomain<? extends ColumnHandle> effectivePredicate;
     private final TupleDomain<ColumnHandle> unenforcedConstraint;
     private final TupleDomain<ColumnHandle> enforcedConstraint;
@@ -43,7 +48,9 @@ public class HivePartitionResult
 
     public HivePartitionResult(
             List<HiveColumnHandle> partitionColumns,
-            Iterable<HivePartition> partitions,
+            List<Column> dataColumns,
+            Map<String, String> tableParameters,
+            List<HivePartition> partitions,
             TupleDomain<? extends ColumnHandle> effectivePredicate,
             TupleDomain<ColumnHandle> unenforcedConstraint,
             TupleDomain<ColumnHandle> enforcedConstraint,
@@ -51,6 +58,8 @@ public class HivePartitionResult
             Optional<HiveBucketFilter> bucketFilter)
     {
         this.partitionColumns = requireNonNull(partitionColumns, "partitionColumns is null");
+        this.dataColumns = ImmutableList.copyOf(requireNonNull(dataColumns, "dataColumns is null"));
+        this.tableParameters = ImmutableMap.copyOf(requireNonNull(tableParameters, "tableProperties is null"));
         this.partitions = requireNonNull(partitions, "partitions is null");
         this.effectivePredicate = requireNonNull(effectivePredicate, "effectivePredicate is null");
         this.unenforcedConstraint = requireNonNull(unenforcedConstraint, "unenforcedConstraint is null");
@@ -64,9 +73,19 @@ public class HivePartitionResult
         return partitionColumns;
     }
 
-    public Iterator<HivePartition> getPartitions()
+    public List<Column> getDataColumns()
     {
-        return partitions.iterator();
+        return dataColumns;
+    }
+
+    public Map<String, String> getTableParameters()
+    {
+        return tableParameters;
+    }
+
+    public List<HivePartition> getPartitions()
+    {
+        return partitions;
     }
 
     public TupleDomain<? extends ColumnHandle> getEffectivePredicate()

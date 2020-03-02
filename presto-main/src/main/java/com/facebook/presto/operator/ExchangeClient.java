@@ -13,17 +13,20 @@
  */
 package com.facebook.presto.operator;
 
+import com.facebook.airlift.http.client.HttpClient;
+import com.facebook.drift.client.DriftClient;
 import com.facebook.presto.execution.TaskId;
 import com.facebook.presto.execution.buffer.PageCodecMarker;
 import com.facebook.presto.execution.buffer.SerializedPage;
 import com.facebook.presto.memory.context.LocalMemoryContext;
-import com.facebook.presto.operator.HttpPageBufferClient.ClientCallback;
+import com.facebook.presto.operator.PageBufferClient.ClientCallback;
 import com.facebook.presto.operator.WorkProcessor.ProcessState;
+import com.facebook.presto.server.thrift.ThriftTaskClient;
+import com.facebook.presto.spi.PrestoException;
 import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
-import io.airlift.http.client.HttpClient;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 
@@ -37,6 +40,7 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -46,16 +50,22 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static com.facebook.presto.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
+import static com.facebook.presto.spi.block.PageBuilderStatus.DEFAULT_MAX_PAGE_SIZE_IN_BYTES;
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Throwables.throwIfUnchecked;
 import static com.google.common.collect.Sets.newConcurrentHashSet;
 import static io.airlift.slice.Slices.EMPTY_SLICE;
+import static io.airlift.units.DataSize.Unit.BYTE;
+import static java.lang.Math.max;
+import static java.lang.Math.min;
 import static java.util.Objects.requireNonNull;
 
 /**
  * {@link ExchangeClient} is the client on receiver side, used in operators requiring data exchange from other tasks,
  * such as {@link ExchangeOperator} and {@link MergeOperator}.
- * For each sender that ExchangeClient receives data from, a {@link HttpPageBufferClient} is used in ExchangeClient to communicate with the sender, i.e.
+ * For each sender that ExchangeClient receives data from, a {@link PageBufferClient} is used in ExchangeClient to communicate with the sender, i.e.
  *
  * <pre>
  *                    /   HttpPageBufferClient_1  - - - Remote Source 1
@@ -77,20 +87,21 @@ public class ExchangeClient
     private final Duration maxErrorDuration;
     private final boolean acknowledgePages;
     private final HttpClient httpClient;
+    private final DriftClient<ThriftTaskClient> driftClient;
     private final ScheduledExecutorService scheduler;
 
     @GuardedBy("this")
     private boolean noMoreLocations;
 
-    private final ConcurrentMap<URI, HttpPageBufferClient> allClients = new ConcurrentHashMap<>();
+    private final ConcurrentMap<URI, PageBufferClient> allClients = new ConcurrentHashMap<>();
     private final ConcurrentMap<TaskId, URI> taskIdToLocationMap = new ConcurrentHashMap<>();
     private final Set<TaskId> removedRemoteSourceTaskIds = ConcurrentHashMap.newKeySet();
 
     @GuardedBy("this")
-    private final Deque<HttpPageBufferClient> queuedClients = new LinkedList<>();
+    private final Deque<PageBufferClient> queuedClients = new LinkedList<>();
 
-    private final Set<HttpPageBufferClient> completedClients = newConcurrentHashSet();
-    private final Set<HttpPageBufferClient> removedClients = newConcurrentHashSet();
+    private final Set<PageBufferClient> completedClients = newConcurrentHashSet();
+    private final Set<PageBufferClient> removedClients = newConcurrentHashSet();
     private final LinkedBlockingDeque<SerializedPage> pageBuffer = new LinkedBlockingDeque<>();
 
     @GuardedBy("this")
@@ -103,7 +114,7 @@ public class ExchangeClient
     @GuardedBy("this")
     private long successfulRequests;
     @GuardedBy("this")
-    private long averageBytesPerRequest;
+    private final ExponentialMovingAverage responseSizeExponentialMovingAverage;
 
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
@@ -119,21 +130,26 @@ public class ExchangeClient
             int concurrentRequestMultiplier,
             Duration maxErrorDuration,
             boolean acknowledgePages,
+            double responseSizeExponentialMovingAverageDecayingAlpha,
             HttpClient httpClient,
+            DriftClient<ThriftTaskClient> driftClient,
             ScheduledExecutorService scheduler,
             LocalMemoryContext systemMemoryContext,
             Executor pageBufferClientCallbackExecutor)
     {
+        checkArgument(responseSizeExponentialMovingAverageDecayingAlpha >= 0.0 && responseSizeExponentialMovingAverageDecayingAlpha <= 1.0, "responseSizeExponentialMovingAverageDecayingAlpha must be between 0 and 1: %s", responseSizeExponentialMovingAverageDecayingAlpha);
         this.bufferCapacity = bufferCapacity.toBytes();
         this.maxResponseSize = maxResponseSize;
         this.concurrentRequestMultiplier = concurrentRequestMultiplier;
         this.maxErrorDuration = maxErrorDuration;
         this.acknowledgePages = acknowledgePages;
         this.httpClient = httpClient;
+        this.driftClient = driftClient;
         this.scheduler = scheduler;
         this.systemMemoryContext = systemMemoryContext;
         this.maxBufferRetainedSizeInBytes = Long.MIN_VALUE;
         this.pageBufferClientCallbackExecutor = requireNonNull(pageBufferClientCallbackExecutor, "pageBufferClientCallbackExecutor is null");
+        this.responseSizeExponentialMovingAverage = new ExponentialMovingAverage(responseSizeExponentialMovingAverageDecayingAlpha, DEFAULT_MAX_PAGE_SIZE_IN_BYTES);
     }
 
     public ExchangeClientStatus getStatus()
@@ -142,7 +158,7 @@ public class ExchangeClient
         // It does not guarantee a consistent view between different exchange clients.
         // Guaranteeing a consistent view introduces significant lock contention.
         ImmutableList.Builder<PageBufferClientStatus> pageBufferClientStatusBuilder = ImmutableList.builder();
-        for (HttpPageBufferClient client : allClients.values()) {
+        for (PageBufferClient client : allClients.values()) {
             pageBufferClientStatusBuilder.add(client.getStatus());
         }
         List<PageBufferClientStatus> pageBufferClientStatus = pageBufferClientStatusBuilder.build();
@@ -151,7 +167,7 @@ public class ExchangeClient
             if (bufferedPages > 0 && pageBuffer.peekLast() == NO_MORE_PAGES) {
                 bufferedPages--;
             }
-            return new ExchangeClientStatus(bufferRetainedSizeInBytes, maxBufferRetainedSizeInBytes, averageBytesPerRequest, successfulRequests, bufferedPages, noMoreLocations, pageBufferClientStatus);
+            return new ExchangeClientStatus(bufferRetainedSizeInBytes, maxBufferRetainedSizeInBytes, responseSizeExponentialMovingAverage.get(), successfulRequests, bufferedPages, noMoreLocations, pageBufferClientStatus);
         }
     }
 
@@ -177,9 +193,21 @@ public class ExchangeClient
 
         checkState(!noMoreLocations, "No more locations already set");
 
-        HttpPageBufferClient client = new HttpPageBufferClient(
-                httpClient,
-                maxResponseSize,
+        RpcShuffleClient resultClient;
+        switch (location.getScheme().toLowerCase(Locale.ENGLISH)) {
+            case "http":
+            case "https":
+                resultClient = new HttpRpcShuffleClient(httpClient, location);
+                break;
+            case "thrift":
+                resultClient = new ThriftRpcShuffleClient(driftClient, location);
+                break;
+            default:
+                throw new PrestoException(GENERIC_INTERNAL_ERROR, "unsupported task result client scheme " + location.getScheme());
+        }
+
+        PageBufferClient client = new PageBufferClient(
+                resultClient,
                 maxErrorDuration,
                 acknowledgePages,
                 location,
@@ -209,7 +237,7 @@ public class ExchangeClient
             return;
         }
 
-        HttpPageBufferClient client = allClients.get(location);
+        PageBufferClient client = allClients.get(location);
         if (client == null) {
             return;
         }
@@ -311,7 +339,7 @@ public class ExchangeClient
             return;
         }
 
-        for (HttpPageBufferClient client : allClients.values()) {
+        for (PageBufferClient client : allClients.values()) {
             closeQuietly(client);
         }
         pageBuffer.clear();
@@ -345,15 +373,15 @@ public class ExchangeClient
         if (neededBytes <= 0) {
             return;
         }
-
-        int clientCount = (int) ((1.0 * neededBytes / averageBytesPerRequest) * concurrentRequestMultiplier);
-        clientCount = Math.max(clientCount, 1);
+        long averageResponseSize = max(1, responseSizeExponentialMovingAverage.get());
+        int clientCount = (int) ((1.0 * neededBytes / averageResponseSize) * concurrentRequestMultiplier);
+        clientCount = max(clientCount, 1);
 
         int pendingClients = allClients.size() - queuedClients.size() - completedClients.size();
         clientCount -= pendingClients;
 
         for (int i = 0; i < clientCount; ) {
-            HttpPageBufferClient client = queuedClients.poll();
+            PageBufferClient client = queuedClients.poll();
             if (client == null) {
                 // no more clients available
                 return;
@@ -363,7 +391,8 @@ public class ExchangeClient
                 continue;
             }
 
-            client.scheduleRequest();
+            DataSize max = new DataSize(min(averageResponseSize * 2, maxResponseSize.toBytes()), BYTE);
+            client.scheduleRequest(max);
             i++;
         }
     }
@@ -396,15 +425,14 @@ public class ExchangeClient
                 .sum();
 
         bufferRetainedSizeInBytes += pagesRetainedSizeInBytes;
-        maxBufferRetainedSizeInBytes = Math.max(maxBufferRetainedSizeInBytes, bufferRetainedSizeInBytes);
+        maxBufferRetainedSizeInBytes = max(maxBufferRetainedSizeInBytes, bufferRetainedSizeInBytes);
         systemMemoryContext.setBytes(bufferRetainedSizeInBytes);
         successfulRequests++;
 
         long responseSize = pages.stream()
                 .mapToLong(SerializedPage::getSizeInBytes)
                 .sum();
-        // AVG_n = AVG_(n-1) * (n-1)/n + VALUE_n / n
-        averageBytesPerRequest = (long) (1.0 * averageBytesPerRequest * (successfulRequests - 1) / successfulRequests + responseSize / successfulRequests);
+        responseSizeExponentialMovingAverage.update(responseSize);
 
         return true;
     }
@@ -419,7 +447,7 @@ public class ExchangeClient
         }
     }
 
-    private synchronized void requestComplete(HttpPageBufferClient client)
+    private synchronized void requestComplete(PageBufferClient client)
     {
         if (!queuedClients.contains(client)) {
             queuedClients.add(client);
@@ -427,14 +455,14 @@ public class ExchangeClient
         scheduleRequestIfNecessary();
     }
 
-    private synchronized void clientFinished(HttpPageBufferClient client)
+    private synchronized void clientFinished(PageBufferClient client)
     {
         requireNonNull(client, "client is null");
         completedClients.add(client);
         scheduleRequestIfNecessary();
     }
 
-    private synchronized void clientFailed(HttpPageBufferClient client, Throwable cause)
+    private synchronized void clientFailed(PageBufferClient client, Throwable cause)
     {
         // ignore failure for removed clients
         if (removedClients.contains(client)) {
@@ -467,7 +495,7 @@ public class ExchangeClient
             implements ClientCallback
     {
         @Override
-        public boolean addPages(HttpPageBufferClient client, List<SerializedPage> pages)
+        public boolean addPages(PageBufferClient client, List<SerializedPage> pages)
         {
             requireNonNull(client, "client is null");
             requireNonNull(pages, "pages is null");
@@ -475,20 +503,20 @@ public class ExchangeClient
         }
 
         @Override
-        public void requestComplete(HttpPageBufferClient client)
+        public void requestComplete(PageBufferClient client)
         {
             requireNonNull(client, "client is null");
             ExchangeClient.this.requestComplete(client);
         }
 
         @Override
-        public void clientFinished(HttpPageBufferClient client)
+        public void clientFinished(PageBufferClient client)
         {
             ExchangeClient.this.clientFinished(client);
         }
 
         @Override
-        public void clientFailed(HttpPageBufferClient client, Throwable cause)
+        public void clientFailed(PageBufferClient client, Throwable cause)
         {
             requireNonNull(client, "client is null");
             requireNonNull(cause, "cause is null");
@@ -497,13 +525,36 @@ public class ExchangeClient
         }
     }
 
-    private static void closeQuietly(HttpPageBufferClient client)
+    private static void closeQuietly(PageBufferClient client)
     {
         try {
             client.close();
         }
         catch (RuntimeException e) {
             // ignored
+        }
+    }
+
+    private static class ExponentialMovingAverage
+    {
+        private final double alpha;
+        private double oldValue;
+
+        public ExponentialMovingAverage(double alpha, long initialValue)
+        {
+            this.alpha = alpha;
+            this.oldValue = initialValue;
+        }
+
+        public void update(long value)
+        {
+            double newValue = oldValue + (alpha * (value - oldValue));
+            oldValue = newValue;
+        }
+
+        public long get()
+        {
+            return (long) oldValue;
         }
     }
 }

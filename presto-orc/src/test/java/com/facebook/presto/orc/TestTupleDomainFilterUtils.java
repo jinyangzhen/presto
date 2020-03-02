@@ -14,19 +14,28 @@
 package com.facebook.presto.orc;
 
 import com.facebook.presto.Session;
+import com.facebook.presto.block.BlockEncodingManager;
+import com.facebook.presto.metadata.FunctionManager;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.orc.TupleDomainFilter.BigintMultiRange;
 import com.facebook.presto.orc.TupleDomainFilter.BigintRange;
-import com.facebook.presto.orc.TupleDomainFilter.BigintValues;
+import com.facebook.presto.orc.TupleDomainFilter.BigintValuesUsingBitmask;
+import com.facebook.presto.orc.TupleDomainFilter.BigintValuesUsingHashTable;
 import com.facebook.presto.orc.TupleDomainFilter.BooleanValue;
 import com.facebook.presto.orc.TupleDomainFilter.BytesRange;
+import com.facebook.presto.orc.TupleDomainFilter.BytesValues;
+import com.facebook.presto.orc.TupleDomainFilter.BytesValuesExclusive;
 import com.facebook.presto.orc.TupleDomainFilter.DoubleRange;
 import com.facebook.presto.orc.TupleDomainFilter.FloatRange;
 import com.facebook.presto.orc.TupleDomainFilter.LongDecimalRange;
 import com.facebook.presto.orc.TupleDomainFilter.MultiRange;
-import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.predicate.Domain;
+import com.facebook.presto.spi.type.NamedTypeSignature;
+import com.facebook.presto.spi.type.RowFieldName;
 import com.facebook.presto.spi.type.Type;
+import com.facebook.presto.spi.type.TypeManager;
+import com.facebook.presto.spi.type.TypeSignatureParameter;
+import com.facebook.presto.sql.analyzer.FeaturesConfig;
 import com.facebook.presto.sql.planner.ExpressionDomainTranslator;
 import com.facebook.presto.sql.planner.LiteralEncoder;
 import com.facebook.presto.sql.planner.Symbol;
@@ -47,6 +56,7 @@ import com.facebook.presto.sql.tree.NotExpression;
 import com.facebook.presto.sql.tree.NullLiteral;
 import com.facebook.presto.sql.tree.QualifiedName;
 import com.facebook.presto.sql.tree.StringLiteral;
+import com.facebook.presto.type.TypeRegistry;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
@@ -63,6 +73,7 @@ import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
 import static com.facebook.presto.metadata.MetadataManager.createTestMetadataManager;
+import static com.facebook.presto.orc.TupleDomainFilter.ALWAYS_FALSE;
 import static com.facebook.presto.orc.TupleDomainFilter.IS_NOT_NULL;
 import static com.facebook.presto.orc.TupleDomainFilter.IS_NULL;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
@@ -76,10 +87,14 @@ import static com.facebook.presto.spi.type.HyperLogLogType.HYPER_LOG_LOG;
 import static com.facebook.presto.spi.type.IntegerType.INTEGER;
 import static com.facebook.presto.spi.type.RealType.REAL;
 import static com.facebook.presto.spi.type.SmallintType.SMALLINT;
+import static com.facebook.presto.spi.type.StandardTypes.ARRAY;
+import static com.facebook.presto.spi.type.StandardTypes.MAP;
+import static com.facebook.presto.spi.type.StandardTypes.ROW;
 import static com.facebook.presto.spi.type.TimestampType.TIMESTAMP;
 import static com.facebook.presto.spi.type.TinyintType.TINYINT;
 import static com.facebook.presto.spi.type.VarbinaryType.VARBINARY;
 import static com.facebook.presto.spi.type.VarcharType.VARCHAR;
+import static com.facebook.presto.spi.type.VarcharType.createVarcharType;
 import static com.facebook.presto.sql.ExpressionUtils.or;
 import static com.facebook.presto.sql.planner.LiteralEncoder.getMagicLiteralFunctionSignature;
 import static com.facebook.presto.sql.tree.BooleanLiteral.FALSE_LITERAL;
@@ -100,6 +115,13 @@ import static org.testng.Assert.assertTrue;
 
 public class TestTupleDomainFilterUtils
 {
+    private static final TypeManager TYPE_MANAGER = new TypeRegistry();
+
+    static {
+        // associate TYPE_MANAGER with a function manager
+        new FunctionManager(TYPE_MANAGER, new BlockEncodingManager(TYPE_MANAGER), new FeaturesConfig());
+    }
+
     private static final Session TEST_SESSION = testSessionBuilder()
             .setCatalog("tpch")
             .setSchema("tiny")
@@ -129,32 +151,40 @@ public class TestTupleDomainFilterUtils
     private static final Symbol C_SMALLINT = new Symbol("c_smallint");
     private static final Symbol C_TINYINT = new Symbol("c_tinyint");
     private static final Symbol C_REAL = new Symbol("c_real");
+    private static final Symbol C_ARRAY = new Symbol("c_array");
+    private static final Symbol C_MAP = new Symbol("c_map");
+    private static final Symbol C_STRUCT = new Symbol("c_struct");
 
-    private static final TypeProvider TYPES = TypeProvider.copyOf(ImmutableMap.<Symbol, Type>builder()
-            .put(C_BIGINT, BIGINT)
-            .put(C_DOUBLE, DOUBLE)
-            .put(C_VARCHAR, VARCHAR)
-            .put(C_BOOLEAN, BOOLEAN)
-            .put(C_BIGINT_1, BIGINT)
-            .put(C_DOUBLE_1, DOUBLE)
-            .put(C_VARCHAR_1, VARCHAR)
-            .put(C_TIMESTAMP, TIMESTAMP)
-            .put(C_DATE, DATE)
-            .put(C_COLOR, COLOR) // Equatable, but not orderable
-            .put(C_HYPER_LOG_LOG, HYPER_LOG_LOG) // Not Equatable or orderable
-            .put(C_VARBINARY, VARBINARY)
-            .put(C_DECIMAL_26_5, createDecimalType(26, 5))
-            .put(C_DECIMAL_23_4, createDecimalType(23, 4))
-            .put(C_INTEGER, INTEGER)
-            .put(C_CHAR, createCharType(10))
-            .put(C_DECIMAL_21_3, createDecimalType(21, 3))
-            .put(C_DECIMAL_12_2, createDecimalType(12, 2))
-            .put(C_DECIMAL_6_1, createDecimalType(6, 1))
-            .put(C_DECIMAL_3_0, createDecimalType(3, 0))
-            .put(C_DECIMAL_2_0, createDecimalType(2, 0))
-            .put(C_SMALLINT, SMALLINT)
-            .put(C_TINYINT, TINYINT)
-            .put(C_REAL, REAL)
+    private static final TypeProvider TYPES = TypeProvider.viewOf(ImmutableMap.<String, Type>builder()
+            .put(C_BIGINT.getName(), BIGINT)
+            .put(C_DOUBLE.getName(), DOUBLE)
+            .put(C_VARCHAR.getName(), VARCHAR)
+            .put(C_BOOLEAN.getName(), BOOLEAN)
+            .put(C_BIGINT_1.getName(), BIGINT)
+            .put(C_DOUBLE_1.getName(), DOUBLE)
+            .put(C_VARCHAR_1.getName(), VARCHAR)
+            .put(C_TIMESTAMP.getName(), TIMESTAMP)
+            .put(C_DATE.getName(), DATE)
+            .put(C_COLOR.getName(), COLOR) // Equatable, but not orderable
+            .put(C_HYPER_LOG_LOG.getName(), HYPER_LOG_LOG) // Not Equatable or orderable
+            .put(C_VARBINARY.getName(), VARBINARY)
+            .put(C_DECIMAL_26_5.getName(), createDecimalType(26, 5))
+            .put(C_DECIMAL_23_4.getName(), createDecimalType(23, 4))
+            .put(C_INTEGER.getName(), INTEGER)
+            .put(C_CHAR.getName(), createCharType(10))
+            .put(C_DECIMAL_21_3.getName(), createDecimalType(21, 3))
+            .put(C_DECIMAL_12_2.getName(), createDecimalType(12, 2))
+            .put(C_DECIMAL_6_1.getName(), createDecimalType(6, 1))
+            .put(C_DECIMAL_3_0.getName(), createDecimalType(3, 0))
+            .put(C_DECIMAL_2_0.getName(), createDecimalType(2, 0))
+            .put(C_SMALLINT.getName(), SMALLINT)
+            .put(C_TINYINT.getName(), TINYINT)
+            .put(C_REAL.getName(), REAL)
+            .put(C_ARRAY.getName(), TYPE_MANAGER.getParameterizedType(ARRAY, ImmutableList.of(TypeSignatureParameter.of(INTEGER.getTypeSignature()))))
+            .put(C_MAP.getName(), TYPE_MANAGER.getParameterizedType(MAP, ImmutableList.of(TypeSignatureParameter.of(INTEGER.getTypeSignature()), TypeSignatureParameter.of(BOOLEAN.getTypeSignature()))))
+            .put(C_STRUCT.getName(), TYPE_MANAGER.getParameterizedType(ROW, ImmutableList.of(
+                    TypeSignatureParameter.of(new NamedTypeSignature(Optional.of(new RowFieldName("field_0", false)), INTEGER.getTypeSignature())),
+                    TypeSignatureParameter.of(new NamedTypeSignature(Optional.of(new RowFieldName("field_1", false)), BOOLEAN.getTypeSignature())))))
             .build());
 
     private Metadata metadata;
@@ -199,7 +229,8 @@ public class TestTupleDomainFilterUtils
         assertEquals(toFilter(not(greaterThan(C_BIGINT, bigintLiteral(2L)))), BigintRange.of(Long.MIN_VALUE, 2L, false));
         assertEquals(toFilter(not(greaterThanOrEqual(C_BIGINT, bigintLiteral(2L)))), BigintRange.of(Long.MIN_VALUE, 1L, false));
 
-        assertEquals(toFilter(in(C_BIGINT, ImmutableList.of(1, 10, 100))), BigintValues.of(new long[] {1, 10, 100}, false));
+        assertEquals(toFilter(in(C_BIGINT, ImmutableList.of(1, 10, 100_000))), BigintValuesUsingHashTable.of(1, 100_000, new long[] {1, 10, 100_000}, false));
+        assertEquals(toFilter(in(C_BIGINT, ImmutableList.of(1, 10, 100))), BigintValuesUsingBitmask.of(1, 100, new long[] {1, 10, 100}, false));
         assertEquals(toFilter(not(in(C_BIGINT, ImmutableList.of(1, 10, 100)))), BigintMultiRange.of(ImmutableList.of(
                 BigintRange.of(Long.MIN_VALUE, 0L, false),
                 BigintRange.of(2L, 9L, false),
@@ -226,7 +257,8 @@ public class TestTupleDomainFilterUtils
                 BigintMultiRange.of(ImmutableList.of(
                         BigintRange.of(Long.MIN_VALUE, 1L, false),
                         BigintRange.of(3L, Long.MAX_VALUE, false)), true));
-        assertEquals(toFilter(or(in(C_BIGINT, ImmutableList.of(1, 10, 100)), isNull(C_BIGINT))), BigintValues.of(new long[] {1, 10, 100}, true));
+        assertEquals(toFilter(or(in(C_BIGINT, ImmutableList.of(1, 10, 100_000)), isNull(C_BIGINT))), BigintValuesUsingHashTable.of(1, 100_000, new long[] {1, 10, 100_000}, true));
+        assertEquals(toFilter(or(in(C_BIGINT, ImmutableList.of(1, 10, 100)), isNull(C_BIGINT))), BigintValuesUsingBitmask.of(1, 100, new long[] {1, 10, 100}, true));
         assertEquals(toFilter(or(not(in(C_BIGINT, ImmutableList.of(1, 10, 100))), isNull(C_BIGINT))), BigintMultiRange.of(ImmutableList.of(
                 BigintRange.of(Long.MIN_VALUE, 0L, false),
                 BigintRange.of(2L, 9L, false),
@@ -240,64 +272,108 @@ public class TestTupleDomainFilterUtils
         assertEquals(toFilter(equal(C_DOUBLE, doubleLiteral(1.2))), DoubleRange.of(1.2, false, false, 1.2, false, false, false));
         assertEquals(toFilter(notEqual(C_DOUBLE, doubleLiteral(1.2))), MultiRange.of(ImmutableList.of(
                 DoubleRange.of(Double.MIN_VALUE, true, true, 1.2, false, true, false),
-                DoubleRange.of(1.2, false, true, Double.MAX_VALUE, true, true, false)), false));
+                DoubleRange.of(1.2, false, true, Double.MAX_VALUE, true, true, false)), false, true));
 
         assertEquals(toFilter(in(C_DOUBLE, ImmutableList.of(1.2, 3.4, 5.6))), MultiRange.of(ImmutableList.of(
                 DoubleRange.of(1.2, false, false, 1.2, false, false, false),
                 DoubleRange.of(3.4, false, false, 3.4, false, false, false),
-                DoubleRange.of(5.6, false, false, 5.6, false, false, false)), false));
+                DoubleRange.of(5.6, false, false, 5.6, false, false, false)), false, false));
 
         assertEquals(toFilter(isDistinctFrom(C_DOUBLE, doubleLiteral(1.2))), MultiRange.of(ImmutableList.of(
                 DoubleRange.of(Double.MIN_VALUE, true, true, 1.2, false, true, false),
-                DoubleRange.of(1.2, false, true, Double.MAX_VALUE, true, true, false)), true));
+                DoubleRange.of(1.2, false, true, Double.MAX_VALUE, true, true, false)), true, true));
 
         assertEquals(toFilter(between(C_DOUBLE, doubleLiteral(1.2), doubleLiteral(3.4))), DoubleRange.of(1.2, false, false, 3.4, false, false, false));
+
+        assertEquals(toFilter(lessThan(C_DOUBLE, doubleLiteral(Double.NaN))), ALWAYS_FALSE);
+        assertEquals(toFilter(lessThanOrEqual(C_DOUBLE, doubleLiteral(Double.NaN))), ALWAYS_FALSE);
+        assertEquals(toFilter(greaterThanOrEqual(C_DOUBLE, doubleLiteral(Double.NaN))), ALWAYS_FALSE);
+        assertEquals(toFilter(greaterThan(C_DOUBLE, doubleLiteral(Double.NaN))), ALWAYS_FALSE);
+        assertEquals(toFilter(notEqual(C_DOUBLE, doubleLiteral(Double.NaN))), ALWAYS_FALSE);
+
+        assertEquals(toFilter(not(in(C_DOUBLE, ImmutableList.of(doubleLiteral(1.2))))), MultiRange.of(ImmutableList.of(
+                DoubleRange.of(Double.MIN_VALUE, true, true, 1.2, false, true, false),
+                DoubleRange.of(1.2, false, true, Double.MAX_VALUE, true, true, false)), false, true));
+
+        assertEquals(toFilter(not(in(C_DOUBLE, ImmutableList.of(doubleLiteral(2.4), doubleLiteral(1.2))))), MultiRange.of(ImmutableList.of(
+                DoubleRange.of(Double.MIN_VALUE, true, true, 1.2, false, true, false),
+                DoubleRange.of(1.2, false, true, 2.4, false, true, false),
+                DoubleRange.of(2.4, false, true, Double.MAX_VALUE, true, true, false)), false, true));
+
+        assertEquals(toFilter((in(C_DOUBLE, ImmutableList.of(doubleLiteral(2.4), doubleLiteral(1.2))))), MultiRange.of(ImmutableList.of(
+                DoubleRange.of(1.2, false, false, 1.2, false, false, false),
+                DoubleRange.of(2.4, false, false, 2.4, false, false, false)), false, false));
     }
 
     @Test
     public void testFloat()
     {
-        Expression realLiteral = toExpression(realValue(1.2f), TYPES.get(C_REAL));
+        Expression realLiteral = toExpression(realValue(1.2f), TYPES.get(C_REAL.toSymbolReference()));
+        Expression realLiteralHigh = toExpression(realValue(2.4f), TYPES.get(C_REAL.toSymbolReference()));
         assertEquals(toFilter(equal(C_REAL, realLiteral)), FloatRange.of(1.2f, false, false, 1.2f, false, false, false));
         assertEquals(toFilter(not(equal(C_REAL, realLiteral))), MultiRange.of(ImmutableList.of(
                 FloatRange.of(Float.MIN_VALUE, true, true, 1.2f, false, true, false),
-                FloatRange.of(1.2f, false, true, Float.MAX_VALUE, true, true, false)), false));
+                FloatRange.of(1.2f, false, true, Float.MAX_VALUE, true, true, false)), false, true));
 
         assertEquals(toFilter(or(isNull(C_REAL), equal(C_REAL, realLiteral))), FloatRange.of(1.2f, false, false, 1.2f, false, false, true));
+
+        Expression floatNaNLiteral = toExpression(realValue(Float.NaN), TYPES.get(C_REAL.toSymbolReference()));
+        assertEquals(toFilter(lessThan(C_REAL, floatNaNLiteral)), ALWAYS_FALSE);
+        assertEquals(toFilter(lessThanOrEqual(C_REAL, floatNaNLiteral)), ALWAYS_FALSE);
+        assertEquals(toFilter(greaterThanOrEqual(C_REAL, floatNaNLiteral)), ALWAYS_FALSE);
+        assertEquals(toFilter(greaterThan(C_REAL, floatNaNLiteral)), ALWAYS_FALSE);
+        assertEquals(toFilter(notEqual(C_REAL, floatNaNLiteral)), ALWAYS_FALSE);
+
+        assertEquals(toFilter(isDistinctFrom(C_REAL, realLiteral)), MultiRange.of(ImmutableList.of(
+                FloatRange.of(Float.MIN_VALUE, true, true, 1.2f, false, true, false),
+                FloatRange.of(1.2f, false, true, Float.MAX_VALUE, true, true, false)), true, true));
+
         assertEquals(toFilter(or(isNull(C_REAL), notEqual(C_REAL, realLiteral))), MultiRange.of(ImmutableList.of(
                 FloatRange.of(Float.MIN_VALUE, true, true, 1.2f, false, true, false),
-                FloatRange.of(1.2f, false, true, Float.MAX_VALUE, true, true, false)), true));
+                FloatRange.of(1.2f, false, true, Float.MAX_VALUE, true, true, false)), true, true));
+
+        assertEquals(toFilter(not(in(C_REAL, ImmutableList.of(realLiteral, realLiteralHigh)))), MultiRange.of(ImmutableList.of(
+                FloatRange.of(Float.MIN_VALUE, true, true, 1.2f, false, true, false),
+                FloatRange.of(1.2f, false, true, 2.4f, false, true, false),
+                FloatRange.of(2.4f, false, true, Float.MAX_VALUE, true, true, false)), false, true));
+
+        assertEquals(toFilter((in(C_REAL, ImmutableList.of(realLiteral, realLiteralHigh)))), MultiRange.of(ImmutableList.of(
+                FloatRange.of(1.2f, false, false, 1.2f, false, false, false),
+                FloatRange.of(2.4f, false, false, 2.4f, false, false, false)), false, false));
     }
 
     @Test
     public void testDecimal()
     {
         Slice decimal = longDecimal("-999999999999999999.999");
-        Expression decimalLiteral = toExpression(decimal, TYPES.get(C_DECIMAL_21_3));
+        Expression decimalLiteral = toExpression(decimal, TYPES.get(C_DECIMAL_21_3.toSymbolReference()));
         assertEquals(toFilter(equal(C_DECIMAL_21_3, decimalLiteral)), LongDecimalRange.of(decimal.getLong(0), decimal.getLong(SIZE_OF_LONG), false, false, decimal.getLong(0), decimal.getLong(SIZE_OF_LONG), false, false, false));
         assertEquals(toFilter(not(equal(C_DECIMAL_21_3, decimalLiteral))), MultiRange.of(ImmutableList.of(
                 LongDecimalRange.of(Long.MIN_VALUE, Long.MIN_VALUE, true, true, decimal.getLong(0), decimal.getLong(SIZE_OF_LONG), false, true, false),
-                LongDecimalRange.of(decimal.getLong(0), decimal.getLong(SIZE_OF_LONG), false, true, Long.MAX_VALUE, Long.MAX_VALUE, true, true, false)), false));
+                LongDecimalRange.of(decimal.getLong(0), decimal.getLong(SIZE_OF_LONG), false, true, Long.MAX_VALUE, Long.MAX_VALUE, true, true, false)), false, false));
 
         assertEquals(toFilter(or(isNull(C_DECIMAL_21_3), equal(C_DECIMAL_21_3, decimalLiteral))), LongDecimalRange.of(decimal.getLong(0), decimal.getLong(SIZE_OF_LONG), false, false, decimal.getLong(0), decimal.getLong(SIZE_OF_LONG), false, false, true));
         assertEquals(toFilter(or(isNull(C_DECIMAL_21_3), not(equal(C_DECIMAL_21_3, decimalLiteral)))), MultiRange.of(ImmutableList.of(
                 LongDecimalRange.of(Long.MIN_VALUE, Long.MIN_VALUE, true, true, decimal.getLong(0), decimal.getLong(SIZE_OF_LONG), false, true, false),
-                LongDecimalRange.of(decimal.getLong(0), decimal.getLong(SIZE_OF_LONG), false, true, Long.MAX_VALUE, Long.MAX_VALUE, true, true, false)), true));
+                LongDecimalRange.of(decimal.getLong(0), decimal.getLong(SIZE_OF_LONG), false, true, Long.MAX_VALUE, Long.MAX_VALUE, true, true, false)), true, false));
     }
 
     @Test
     public void testVarchar()
     {
         assertEquals(toFilter(equal(C_VARCHAR, stringLiteral("abc", VARCHAR))), BytesRange.of(toBytes("abc"), false, toBytes("abc"), false, false));
-        assertEquals(toFilter(not(equal(C_VARCHAR, stringLiteral("abc", VARCHAR)))), MultiRange.of(ImmutableList.of(
-                BytesRange.of(null, true, toBytes("abc"), true, false),
-                BytesRange.of(toBytes("abc"), true, null, true, false)), false));
+        assertEquals(toFilter(not(equal(C_VARCHAR, stringLiteral("abc", VARCHAR)))), TupleDomainFilter.BytesValuesExclusive.of(new byte[][]{toBytes("abc")}, false));
 
         assertEquals(toFilter(lessThan(C_VARCHAR, stringLiteral("abc", VARCHAR))), BytesRange.of(null, true, toBytes("abc"), true, false));
         assertEquals(toFilter(lessThanOrEqual(C_VARCHAR, stringLiteral("abc", VARCHAR))), BytesRange.of(null, true, toBytes("abc"), false, false));
 
         assertEquals(toFilter(between(C_VARCHAR, stringLiteral("apple", VARCHAR), stringLiteral("banana", VARCHAR))), BytesRange.of(toBytes("apple"), false, toBytes("banana"), false, false));
         assertEquals(toFilter(or(isNull(C_VARCHAR), equal(C_VARCHAR, stringLiteral("abc", VARCHAR)))), BytesRange.of(toBytes("abc"), false, toBytes("abc"), false, true));
+
+        assertEquals(toFilter(in(C_VARCHAR, ImmutableList.of(stringLiteral("Ex", createVarcharType(7)), stringLiteral("oriente")))),
+                BytesValues.of(new byte[][] {toBytes("Ex"), toBytes("oriente")}, false));
+        assertEquals(toFilter(not(in(C_VARCHAR, ImmutableList.of(stringLiteral("Ex", createVarcharType(7)), stringLiteral("oriente"))))),
+                BytesValuesExclusive.of(new byte[][]{toBytes("Ex"), toBytes("oriente")}, false));
     }
 
     @Test
@@ -316,6 +392,27 @@ public class TestTupleDomainFilterUtils
         assertEquals(toFilter(not(lessThanOrEqual(C_DATE, dateLiteral("2019-06-01")))), BigintRange.of(days + 1, Long.MAX_VALUE, false));
     }
 
+    @Test
+    public void testMap()
+    {
+        assertEquals(toFilter(isNotNull(C_MAP)), IS_NOT_NULL);
+        assertEquals(toFilter(isNull(C_MAP)), IS_NULL);
+    }
+
+    @Test
+    public void testArray()
+    {
+        assertEquals(toFilter(isNotNull(C_ARRAY)), IS_NOT_NULL);
+        assertEquals(toFilter(isNull(C_ARRAY)), IS_NULL);
+    }
+
+    @Test
+    public void testStruct()
+    {
+        assertEquals(toFilter(isNotNull(C_STRUCT)), IS_NOT_NULL);
+        assertEquals(toFilter(isNull(C_STRUCT)), IS_NULL);
+    }
+
     private static byte[] toBytes(String value)
     {
         return Slices.utf8Slice(value).getBytes();
@@ -323,15 +420,10 @@ public class TestTupleDomainFilterUtils
 
     private TupleDomainFilter toFilter(Expression expression)
     {
-        Optional<Map<Symbol, Domain>> domains = fromPredicate(expression).getTupleDomain().getDomains();
+        Optional<Map<String, Domain>> domains = fromPredicate(expression).getTupleDomain().getDomains();
         assertTrue(domains.isPresent());
         Domain domain = Iterables.getOnlyElement(domains.get().values());
         return TupleDomainFilterUtils.toFilter(domain);
-    }
-
-    private TupleDomainOrcPredicate.ColumnReference columnReference(ColumnHandle column, Type type)
-    {
-        return new TupleDomainOrcPredicate.ColumnReference<>(column, 0, type);
     }
 
     private ExpressionDomainTranslator.ExtractionResult fromPredicate(Expression originalPredicate)
@@ -386,7 +478,7 @@ public class TestTupleDomainFilterUtils
 
     private InPredicate in(Symbol symbol, List<?> values)
     {
-        return in(symbol.toSymbolReference(), TYPES.get(symbol), values);
+        return in(symbol.toSymbolReference(), TYPES.get(symbol.toSymbolReference()), values);
     }
 
     private static BetweenPredicate between(Symbol symbol, Expression min, Expression max)
@@ -511,7 +603,7 @@ public class TestTupleDomainFilterUtils
 
     private static FunctionCall colorLiteral(long value)
     {
-        return new FunctionCall(QualifiedName.of(getMagicLiteralFunctionSignature(COLOR).getName()), ImmutableList.of(bigintLiteral(value)));
+        return new FunctionCall(QualifiedName.of(getMagicLiteralFunctionSignature(COLOR).getName().getFunctionName()), ImmutableList.of(bigintLiteral(value)));
     }
 
     private Expression varbinaryLiteral(Slice value)

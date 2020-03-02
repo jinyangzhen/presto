@@ -17,14 +17,11 @@ import com.facebook.presto.Session;
 import com.facebook.presto.metadata.MetadataManager;
 import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
-import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.spi.type.VarcharType;
 import com.facebook.presto.sql.TestingRowExpressionTranslator;
-import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.planner.TypeProvider;
 import com.facebook.presto.sql.tree.Expression;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
@@ -127,15 +124,15 @@ public class TestFilterStatsCalculator
                 .setOutputRowCount(1000.0)
                 .build();
 
-        standardTypes = TypeProvider.copyOf(ImmutableMap.<Symbol, Type>builder()
-                .put(new Symbol("x"), DOUBLE)
-                .put(new Symbol("y"), DOUBLE)
-                .put(new Symbol("z"), DOUBLE)
-                .put(new Symbol("leftOpen"), DOUBLE)
-                .put(new Symbol("rightOpen"), DOUBLE)
-                .put(new Symbol("unknownRange"), DOUBLE)
-                .put(new Symbol("emptyRange"), DOUBLE)
-                .put(new Symbol("mediumVarchar"), MEDIUM_VARCHAR_TYPE)
+        standardTypes = TypeProvider.fromVariables(ImmutableList.<VariableReferenceExpression>builder()
+                .add(new VariableReferenceExpression("x", DOUBLE))
+                .add(new VariableReferenceExpression("y", DOUBLE))
+                .add(new VariableReferenceExpression("z", DOUBLE))
+                .add(new VariableReferenceExpression("leftOpen", DOUBLE))
+                .add(new VariableReferenceExpression("rightOpen", DOUBLE))
+                .add(new VariableReferenceExpression("unknownRange", DOUBLE))
+                .add(new VariableReferenceExpression("emptyRange", DOUBLE))
+                .add(new VariableReferenceExpression("mediumVarchar", MEDIUM_VARCHAR_TYPE))
                 .build());
 
         session = testSessionBuilder().build();
@@ -178,7 +175,7 @@ public class TestFilterStatsCalculator
         // For ExpressionInterpreter, cast will return unknown; but RowExpressionInterpreter can actually evaluate cast.
         Expression expression = expression("cast(null as boolean) AND sin(x) > x");
         RowExpression rowExpression = translator.translateAndOptimize(expression, standardTypes);
-        PlanNodeStatsEstimate rowExpressionStatsEstimate = statsCalculator.filterStats(standardInputStatistics, rowExpression, session, standardTypes);
+        PlanNodeStatsEstimate rowExpressionStatsEstimate = statsCalculator.filterStats(standardInputStatistics, rowExpression, session);
         PlanNodeStatsAssertion.assertThat(rowExpressionStatsEstimate).outputRowsCount(0.0);
     }
 
@@ -599,7 +596,7 @@ public class TestFilterStatsCalculator
         // assert both visitors yield the same result
         RowExpression rowExpression = translator.translateAndOptimize(expression, standardTypes);
         PlanNodeStatsEstimate expressionStatsEstimate = statsCalculator.filterStats(standardInputStatistics, expression, session, standardTypes);
-        PlanNodeStatsEstimate rowExpressionStatsEstimate = statsCalculator.filterStats(standardInputStatistics, rowExpression, session, standardTypes);
+        PlanNodeStatsEstimate rowExpressionStatsEstimate = statsCalculator.filterStats(standardInputStatistics, rowExpression, session);
         assertEquals(expressionStatsEstimate, rowExpressionStatsEstimate);
 
         return PlanNodeStatsAssertion.assertThat(expressionStatsEstimate);

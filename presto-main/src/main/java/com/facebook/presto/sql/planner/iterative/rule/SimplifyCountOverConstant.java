@@ -18,15 +18,14 @@ import com.facebook.presto.matching.Captures;
 import com.facebook.presto.matching.Pattern;
 import com.facebook.presto.metadata.FunctionManager;
 import com.facebook.presto.spi.function.StandardFunctionResolution;
+import com.facebook.presto.spi.plan.AggregationNode;
+import com.facebook.presto.spi.plan.Assignments;
+import com.facebook.presto.spi.plan.ProjectNode;
 import com.facebook.presto.spi.relation.CallExpression;
 import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
-import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.planner.TypeProvider;
 import com.facebook.presto.sql.planner.iterative.Rule;
-import com.facebook.presto.sql.planner.plan.AggregationNode;
-import com.facebook.presto.sql.planner.plan.Assignments;
-import com.facebook.presto.sql.planner.plan.ProjectNode;
 import com.facebook.presto.sql.relational.FunctionResolution;
 import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.sql.tree.Literal;
@@ -82,7 +81,7 @@ public class SimplifyCountOverConstant
             VariableReferenceExpression variable = entry.getKey();
             AggregationNode.Aggregation aggregation = entry.getValue();
 
-            if (isCountOverConstant(aggregation, child.getAssignments(), context.getSymbolAllocator().getTypes())) {
+            if (isCountOverConstant(aggregation, child.getAssignments(), context.getVariableAllocator().getTypes())) {
                 changed = true;
                 aggregations.put(variable, new AggregationNode.Aggregation(
                         new CallExpression(
@@ -121,7 +120,7 @@ public class SimplifyCountOverConstant
         RowExpression argument = aggregation.getArguments().get(0);
         Expression assigned = null;
         if (castToExpression(argument) instanceof SymbolReference) {
-            assigned = castToExpression(inputs.get(toVariableReference(Symbol.from(castToExpression(argument)), types)));
+            assigned = castToExpression(inputs.get(toVariableReference(castToExpression(argument), types)));
         }
 
         return assigned instanceof Literal && !(assigned instanceof NullLiteral);

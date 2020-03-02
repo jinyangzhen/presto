@@ -29,8 +29,8 @@ import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.gen.ExpressionCompiler;
 import com.facebook.presto.sql.gen.PageFunctionCompiler;
 import com.facebook.presto.sql.parser.SqlParser;
-import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.planner.TypeProvider;
+import com.facebook.presto.sql.relational.RowExpressionOptimizer;
 import com.facebook.presto.sql.relational.SqlToRowExpressionTranslator;
 import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.sql.tree.NodeRef;
@@ -65,6 +65,7 @@ import static com.facebook.presto.SessionTestUtils.TEST_SESSION;
 import static com.facebook.presto.memory.context.AggregatedMemoryContext.newSimpleAggregatedMemoryContext;
 import static com.facebook.presto.metadata.MetadataManager.createTestMetadataManager;
 import static com.facebook.presto.operator.scalar.FunctionAssertions.createExpression;
+import static com.facebook.presto.spi.relation.ExpressionOptimizer.Level.OPTIMIZED;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.spi.type.DecimalType.createDecimalType;
 import static com.facebook.presto.spi.type.DoubleType.DOUBLE;
@@ -546,8 +547,7 @@ public class BenchmarkDecimalOperators
         private final MetadataManager metadata = createTestMetadataManager();
         private final Random random = new Random();
 
-        protected final Map<String, Symbol> symbols = new HashMap<>();
-        protected final Map<Symbol, Type> symbolTypes = new HashMap<>();
+        protected final Map<String, Type> symbolTypes = new HashMap<>();
         private final Map<VariableReferenceExpression, Integer> sourceLayout = new HashMap<>();
         protected final List<Type> types = new LinkedList<>();
 
@@ -567,9 +567,7 @@ public class BenchmarkDecimalOperators
 
         protected void addSymbol(String name, Type type)
         {
-            Symbol symbol = new Symbol(name);
-            symbols.put(name, symbol);
-            symbolTypes.put(symbol, type);
+            symbolTypes.put(name, type);
             sourceLayout.put(new VariableReferenceExpression(name, type), types.size());
             types.add(type);
         }
@@ -598,7 +596,7 @@ public class BenchmarkDecimalOperators
 
         protected void generateProcessor(String expression)
         {
-            processor = new ExpressionCompiler(metadata, new PageFunctionCompiler(metadata, 0)).compilePageProcessor(Optional.empty(), ImmutableList.of(rowExpression(expression))).get();
+            processor = new ExpressionCompiler(metadata, new PageFunctionCompiler(metadata, 0)).compilePageProcessor(SESSION.getSqlFunctionProperties(), Optional.empty(), ImmutableList.of(rowExpression(expression))).get();
         }
 
         protected void setDoubleMaxValue(double doubleMaxValue)
@@ -611,7 +609,9 @@ public class BenchmarkDecimalOperators
             Expression expression = createExpression(value, metadata, TypeProvider.copyOf(symbolTypes));
 
             Map<NodeRef<Expression>, Type> expressionTypes = getExpressionTypes(TEST_SESSION, metadata, SQL_PARSER, TypeProvider.copyOf(symbolTypes), expression, emptyList(), WarningCollector.NOOP);
-            return SqlToRowExpressionTranslator.translate(expression, expressionTypes, sourceLayout, metadata.getFunctionManager(), metadata.getTypeManager(), TEST_SESSION, true);
+            RowExpression rowExpression = SqlToRowExpressionTranslator.translate(expression, expressionTypes, sourceLayout, metadata.getFunctionManager(), metadata.getTypeManager(), TEST_SESSION);
+            RowExpressionOptimizer optimizer = new RowExpressionOptimizer(metadata);
+            return optimizer.optimize(rowExpression, OPTIMIZED, TEST_SESSION.toConnectorSession());
         }
 
         private Object generateRandomValue(Type type)

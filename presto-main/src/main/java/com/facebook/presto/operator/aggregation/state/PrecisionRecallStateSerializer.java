@@ -13,7 +13,7 @@
  */
 package com.facebook.presto.operator.aggregation.state;
 
-import com.facebook.presto.operator.aggregation.FixedDoubleHistogram;
+import com.facebook.presto.operator.aggregation.fixedhistogram.FixedDoubleHistogram;
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.block.BlockBuilder;
 import com.facebook.presto.spi.function.AccumulatorStateSerializer;
@@ -67,8 +67,8 @@ public class PrecisionRecallStateSerializer
                 hasHistograms == 0 || hasHistograms == 1,
                 "hasHistogram %s should be boolean-convertible", hasHistograms);
         if (hasHistograms == 1) {
-            state.setTrueWeights(new FixedDoubleHistogram(input));
-            state.setFalseWeights(new FixedDoubleHistogram(input));
+            state.setTrueWeights(FixedDoubleHistogram.deserialize(input));
+            state.setFalseWeights(FixedDoubleHistogram.deserialize(input));
         }
     }
 }

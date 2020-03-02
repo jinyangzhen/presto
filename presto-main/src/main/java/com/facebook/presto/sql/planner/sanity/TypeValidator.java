@@ -18,7 +18,11 @@ import com.facebook.presto.execution.warnings.WarningCollector;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.spi.function.FunctionHandle;
 import com.facebook.presto.spi.function.FunctionMetadata;
+import com.facebook.presto.spi.plan.AggregationNode;
+import com.facebook.presto.spi.plan.AggregationNode.Aggregation;
 import com.facebook.presto.spi.plan.PlanNode;
+import com.facebook.presto.spi.plan.ProjectNode;
+import com.facebook.presto.spi.plan.UnionNode;
 import com.facebook.presto.spi.relation.CallExpression;
 import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
@@ -27,17 +31,11 @@ import com.facebook.presto.spi.type.TypeManager;
 import com.facebook.presto.spi.type.TypeSignature;
 import com.facebook.presto.sql.parser.SqlParser;
 import com.facebook.presto.sql.planner.SimplePlanVisitor;
-import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.planner.TypeProvider;
-import com.facebook.presto.sql.planner.plan.AggregationNode;
-import com.facebook.presto.sql.planner.plan.AggregationNode.Aggregation;
-import com.facebook.presto.sql.planner.plan.ProjectNode;
-import com.facebook.presto.sql.planner.plan.UnionNode;
 import com.facebook.presto.sql.planner.plan.WindowNode;
 import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.sql.tree.NodeRef;
 import com.facebook.presto.sql.tree.SymbolReference;
-import com.google.common.collect.ListMultimap;
 
 import java.util.List;
 import java.util.Map;
@@ -123,7 +121,7 @@ public final class TypeValidator
                 if (isExpression(expression)) {
                     if (castToExpression(expression) instanceof SymbolReference) {
                         SymbolReference symbolReference = (SymbolReference) castToExpression(expression);
-                        verifyTypeSignature(entry.getKey(), types.get(Symbol.from(symbolReference)).getTypeSignature());
+                        verifyTypeSignature(entry.getKey(), types.get(symbolReference).getTypeSignature());
                         continue;
                     }
                     Map<NodeRef<Expression>, Type> expressionTypes = getExpressionTypes(session, metadata, sqlParser, types, castToExpression(expression), emptyList(), warningCollector);
@@ -144,9 +142,8 @@ public final class TypeValidator
         {
             visitPlan(node, context);
 
-            ListMultimap<VariableReferenceExpression, VariableReferenceExpression> variableMapping = node.getVariableMapping();
-            for (VariableReferenceExpression keyVariable : variableMapping.keySet()) {
-                List<VariableReferenceExpression> valueVariables = variableMapping.get(keyVariable);
+            for (VariableReferenceExpression keyVariable : node.getOutputVariables()) {
+                List<VariableReferenceExpression> valueVariables = node.getVariableMapping().get(keyVariable);
                 for (VariableReferenceExpression valueVariable : valueVariables) {
                     verifyTypeSignature(keyVariable, valueVariable.getType().getTypeSignature());
                 }

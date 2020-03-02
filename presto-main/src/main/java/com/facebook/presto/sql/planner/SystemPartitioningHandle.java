@@ -15,7 +15,7 @@ package com.facebook.presto.sql.planner;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.execution.scheduler.NodeScheduler;
-import com.facebook.presto.execution.scheduler.NodeSelector;
+import com.facebook.presto.execution.scheduler.nodeSelection.NodeSelector;
 import com.facebook.presto.metadata.InternalNode;
 import com.facebook.presto.operator.BucketPartitionFunction;
 import com.facebook.presto.operator.HashGenerator;
@@ -167,6 +167,18 @@ public final class SystemPartitioningHandle
 
         BucketFunction bucketFunction = function.createBucketFunction(partitionChannelTypes, isHashPrecomputed, bucketToPartition.length);
         return new BucketPartitionFunction(bucketFunction, bucketToPartition);
+    }
+
+    public static boolean isCompatibleSystemPartitioning(PartitioningHandle first, PartitioningHandle second)
+    {
+        ConnectorPartitioningHandle firstConnectorHandle = first.getConnectorHandle();
+        ConnectorPartitioningHandle secondConnectorHandle = second.getConnectorHandle();
+        if ((firstConnectorHandle instanceof SystemPartitioningHandle) &&
+                (secondConnectorHandle instanceof SystemPartitioningHandle)) {
+            return ((SystemPartitioningHandle) firstConnectorHandle).getPartitioning() ==
+                    ((SystemPartitioningHandle) secondConnectorHandle).getPartitioning();
+        }
+        return false;
     }
 
     public enum SystemPartitionFunction

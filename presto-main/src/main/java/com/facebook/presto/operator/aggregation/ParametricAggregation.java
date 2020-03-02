@@ -58,7 +58,7 @@ public class ParametricAggregation
             AggregationHeader details,
             ParametricImplementationsGroup<AggregationImplementation> implementations)
     {
-        super(signature, details.isHidden());
+        super(signature, details.getVisibility());
         this.details = requireNonNull(details, "details is null");
         this.implementations = requireNonNull(implementations, "implementations is null");
     }
@@ -94,7 +94,7 @@ public class ParametricAggregation
         List<ParameterMetadata> parametersMetadata = buildParameterMetadata(concreteImplementation.getInputParameterMetadataTypes(), inputTypes);
 
         // Generate Aggregation name
-        String aggregationName = generateAggregationName(getSignature().getName(), outputType.getTypeSignature(), signaturesFromTypes(inputTypes));
+        String aggregationName = generateAggregationName(getSignature().getNameSuffix(), outputType.getTypeSignature(), signaturesFromTypes(inputTypes));
 
         // Collect all collected data in Metadata
         AggregationMetadata metadata = new AggregationMetadata(
@@ -110,7 +110,7 @@ public class ParametricAggregation
                 outputType);
 
         // Create specialized InternalAggregregationFunction for Presto
-        return new InternalAggregationFunction(getSignature().getName(),
+        return new InternalAggregationFunction(getSignature().getNameSuffix(),
                 inputTypes,
                 ImmutableList.of(stateSerializer.getSerializedType()),
                 outputType,

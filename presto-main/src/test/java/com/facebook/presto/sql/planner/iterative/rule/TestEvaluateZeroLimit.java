@@ -47,10 +47,10 @@ public class TestEvaluateZeroLimit
                                 p.filter(
                                         expression("b > 5"),
                                         p.values(
-                                                ImmutableList.of(p.variable(p.symbol("a")), p.variable(p.symbol("b"))),
+                                                ImmutableList.of(p.variable("a"), p.variable("b")),
                                                 ImmutableList.of(
-                                                        constantExpressions(BIGINT, 1, 10),
-                                                        constantExpressions(BIGINT, 2, 11))))))
+                                                        constantExpressions(BIGINT, 1L, 10L),
+                                                        constantExpressions(BIGINT, 2L, 11L))))))
                 // TODO: verify contents
                 .matches(values(ImmutableMap.of()));
     }

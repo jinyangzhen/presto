@@ -13,21 +13,23 @@
  */
 package com.facebook.presto.execution;
 
+import com.facebook.airlift.concurrent.SetThreadName;
 import com.facebook.presto.Session;
 import com.facebook.presto.event.SplitMonitor;
 import com.facebook.presto.execution.buffer.OutputBuffer;
 import com.facebook.presto.execution.executor.TaskExecutor;
+import com.facebook.presto.execution.scheduler.TableWriteInfo;
 import com.facebook.presto.memory.QueryContext;
 import com.facebook.presto.operator.TaskContext;
 import com.facebook.presto.operator.TaskExchangeClientManager;
+import com.facebook.presto.spi.block.BlockEncodingSerde;
+import com.facebook.presto.sql.gen.OrderingCompiler;
+import com.facebook.presto.sql.planner.HttpRemoteSourceFactory;
 import com.facebook.presto.sql.planner.LocalExecutionPlanner;
 import com.facebook.presto.sql.planner.LocalExecutionPlanner.LocalExecutionPlan;
 import com.facebook.presto.sql.planner.PlanFragment;
-import com.facebook.presto.sql.planner.TypeProvider;
-import io.airlift.concurrent.SetThreadName;
 
 import java.util.List;
-import java.util.OptionalInt;
 import java.util.concurrent.Executor;
 
 import static com.facebook.presto.execution.SqlTaskExecution.createSqlTaskExecution;
@@ -41,6 +43,8 @@ public class SqlTaskExecutionFactory
     private final TaskExecutor taskExecutor;
 
     private final LocalExecutionPlanner planner;
+    private final BlockEncodingSerde blockEncodingSerde;
+    private final OrderingCompiler orderingCompiler;
     private final SplitMonitor splitMonitor;
     private final boolean perOperatorCpuTimerEnabled;
     private final boolean cpuTimerEnabled;
@@ -50,12 +54,16 @@ public class SqlTaskExecutionFactory
             Executor taskNotificationExecutor,
             TaskExecutor taskExecutor,
             LocalExecutionPlanner planner,
+            BlockEncodingSerde blockEncodingSerde,
+            OrderingCompiler orderingCompiler,
             SplitMonitor splitMonitor,
             TaskManagerConfig config)
     {
         this.taskNotificationExecutor = requireNonNull(taskNotificationExecutor, "taskNotificationExecutor is null");
         this.taskExecutor = requireNonNull(taskExecutor, "taskExecutor is null");
         this.planner = requireNonNull(planner, "planner is null");
+        this.blockEncodingSerde = requireNonNull(blockEncodingSerde, "blockEncodingSerde is null");
+        this.orderingCompiler = requireNonNull(orderingCompiler, "orderingCompiler is null");
         this.splitMonitor = requireNonNull(splitMonitor, "splitMonitor is null");
         requireNonNull(config, "config is null");
         this.perOperatorCpuTimerEnabled = config.isPerOperatorCpuTimerEnabled();
@@ -71,14 +79,13 @@ public class SqlTaskExecutionFactory
             TaskExchangeClientManager taskExchangeClientManager,
             PlanFragment fragment,
             List<TaskSource> sources,
-            OptionalInt totalPartitions)
+            TableWriteInfo tableWriteInfo)
     {
         TaskContext taskContext = queryContext.addTaskContext(
                 taskStateMachine,
                 session,
                 perOperatorCpuTimerEnabled,
                 cpuTimerEnabled,
-                totalPartitions,
                 legacyLifespanCompletionCondition);
 
         LocalExecutionPlan localExecutionPlan;
@@ -87,12 +94,12 @@ public class SqlTaskExecutionFactory
                 localExecutionPlan = planner.plan(
                         taskContext,
                         fragment.getRoot(),
-                        TypeProvider.fromVariables(fragment.getVariables()),
                         fragment.getPartitioningScheme(),
                         fragment.getStageExecutionDescriptor(),
                         fragment.getTableScanSchedulingOrder(),
                         outputBuffer,
-                        taskExchangeClientManager);
+                        new HttpRemoteSourceFactory(blockEncodingSerde, taskExchangeClientManager, orderingCompiler),
+                        tableWriteInfo);
             }
             catch (Throwable e) {
                 // planning failed

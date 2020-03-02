@@ -51,6 +51,7 @@ import static java.util.Objects.requireNonNull;
 /**
  * Makes equality based inferences to rewrite Expressions and generate equality sets in terms of specified symbol scopes
  */
+@Deprecated
 public class EqualityInference
 {
     // Ordering used to determine Expression preference when determining canonicals
@@ -61,7 +62,7 @@ public class EqualityInference
         // 3) Sort the expressions alphabetically - creates a stable consistent ordering (extremely useful for unit testing)
         // TODO: be more precise in determining the cost of an expression
         return ComparisonChain.start()
-                .compare(SymbolsExtractor.extractAll(expression1).size(), SymbolsExtractor.extractAll(expression2).size())
+                .compare(VariablesExtractor.extractAllSymbols(expression1).size(), VariablesExtractor.extractAllSymbols(expression2).size())
                 .compare(SubExpressionExtractor.extract(expression1).size(), SubExpressionExtractor.extract(expression2).size())
                 .compare(expression1.toString(), expression2.toString())
                 .result();
@@ -250,7 +251,7 @@ public class EqualityInference
 
     private static Predicate<Expression> variableToExpressionPredicate(final Predicate<VariableReferenceExpression> variableScope, TypeProvider types)
     {
-        return expression -> Iterables.all(SymbolsExtractor.extractUniqueVariable(expression, types), variableScope);
+        return expression -> Iterables.all(VariablesExtractor.extractUnique(expression, types), variableScope);
     }
 
     /**

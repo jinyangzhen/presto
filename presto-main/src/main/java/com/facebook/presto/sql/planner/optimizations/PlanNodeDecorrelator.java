@@ -14,21 +14,20 @@
 
 package com.facebook.presto.sql.planner.optimizations;
 
+import com.facebook.presto.spi.plan.AggregationNode;
+import com.facebook.presto.spi.plan.Assignments;
 import com.facebook.presto.spi.plan.FilterNode;
+import com.facebook.presto.spi.plan.LimitNode;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.PlanNodeIdAllocator;
+import com.facebook.presto.spi.plan.ProjectNode;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.sql.ExpressionUtils;
-import com.facebook.presto.sql.planner.Symbol;
-import com.facebook.presto.sql.planner.SymbolAllocator;
-import com.facebook.presto.sql.planner.SymbolsExtractor;
+import com.facebook.presto.sql.planner.PlanVariableAllocator;
+import com.facebook.presto.sql.planner.VariablesExtractor;
 import com.facebook.presto.sql.planner.iterative.Lookup;
-import com.facebook.presto.sql.planner.plan.AggregationNode;
-import com.facebook.presto.sql.planner.plan.Assignments;
 import com.facebook.presto.sql.planner.plan.EnforceSingleRowNode;
 import com.facebook.presto.sql.planner.plan.InternalPlanVisitor;
-import com.facebook.presto.sql.planner.plan.LimitNode;
-import com.facebook.presto.sql.planner.plan.ProjectNode;
 import com.facebook.presto.sql.tree.ComparisonExpression;
 import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.sql.tree.SymbolReference;
@@ -45,7 +44,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-import static com.facebook.presto.sql.planner.plan.AggregationNode.singleGroupingSet;
+import static com.facebook.presto.spi.plan.AggregationNode.singleGroupingSet;
 import static com.facebook.presto.sql.planner.plan.AssignmentUtils.identitiesAsSymbolReferences;
 import static com.facebook.presto.sql.relational.OriginalExpressionUtils.castToExpression;
 import static com.facebook.presto.sql.relational.OriginalExpressionUtils.castToRowExpression;
@@ -57,13 +56,13 @@ import static java.util.Objects.requireNonNull;
 public class PlanNodeDecorrelator
 {
     private final PlanNodeIdAllocator idAllocator;
-    private final SymbolAllocator symbolAllocator;
+    private final PlanVariableAllocator variableAllocator;
     private final Lookup lookup;
 
-    public PlanNodeDecorrelator(PlanNodeIdAllocator idAllocator, SymbolAllocator symbolAllocator, Lookup lookup)
+    public PlanNodeDecorrelator(PlanNodeIdAllocator idAllocator, PlanVariableAllocator variableAllocator, Lookup lookup)
     {
         this.idAllocator = requireNonNull(idAllocator, "idAllocator is null");
-        this.symbolAllocator = requireNonNull(symbolAllocator, "symbolAllocator is null");
+        this.variableAllocator = requireNonNull(variableAllocator, "variableAllocator is null");
         this.lookup = requireNonNull(lookup, "lookup is null");
     }
 
@@ -132,7 +131,7 @@ public class PlanNodeDecorrelator
                     childDecorrelationResult.node,
                     castToRowExpression(ExpressionUtils.combineConjuncts(uncorrelatedPredicates)));
 
-            Set<VariableReferenceExpression> variablesToPropagate = Sets.difference(SymbolsExtractor.extractUniqueVariable(correlatedPredicates, symbolAllocator.getTypes()), ImmutableSet.copyOf(correlation));
+            Set<VariableReferenceExpression> variablesToPropagate = Sets.difference(VariablesExtractor.extractUnique(correlatedPredicates, variableAllocator.getTypes()), ImmutableSet.copyOf(correlation));
             return Optional.of(new DecorrelationResult(
                     newFilterNode,
                     Sets.union(childDecorrelationResult.variablesToPropagate, variablesToPropagate),
@@ -292,8 +291,8 @@ public class PlanNodeDecorrelator
                     continue;
                 }
 
-                VariableReferenceExpression left = symbolAllocator.toVariableReference(Symbol.from(comparison.getLeft()));
-                VariableReferenceExpression right = symbolAllocator.toVariableReference(Symbol.from(comparison.getRight()));
+                VariableReferenceExpression left = variableAllocator.toVariableReference(comparison.getLeft());
+                VariableReferenceExpression right = variableAllocator.toVariableReference(comparison.getRight());
 
                 if (correlation.contains(left) && !correlation.contains(right)) {
                     mapping.put(left, right);
@@ -309,7 +308,7 @@ public class PlanNodeDecorrelator
 
         private boolean isCorrelated(Expression expression)
         {
-            return correlation.stream().anyMatch(SymbolsExtractor.extractUniqueVariable(expression, symbolAllocator.getTypes())::contains);
+            return correlation.stream().anyMatch(VariablesExtractor.extractUnique(expression, variableAllocator.getTypes())::contains);
         }
     }
 
@@ -369,7 +368,7 @@ public class PlanNodeDecorrelator
 
     private boolean containsCorrelation(PlanNode node, List<VariableReferenceExpression> correlation)
     {
-        return Sets.union(SymbolsExtractor.extractUniqueVariable(node, lookup, symbolAllocator.getTypes()), SymbolsExtractor.extractOutputVariables(node, lookup, symbolAllocator.getTypes())).stream().anyMatch(correlation::contains);
+        return Sets.union(VariablesExtractor.extractUnique(node, lookup, variableAllocator.getTypes()), VariablesExtractor.extractOutputVariables(node, lookup)).stream().anyMatch(correlation::contains);
     }
 
     public static class DecorrelatedNode
